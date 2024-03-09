@@ -1,15 +1,12 @@
 use crate::{
-    motion::Motion,
+    motion::{self, Motion},
     object::Object,
     state::Mode,
-    utils::{coerce_punctuation, copy_selections_content},
+    utils::copy_selections_content,
     Vim,
 };
 use editor::{
-    display_map::DisplaySnapshot,
-    movement::{self, FindRange, TextLayoutDetails},
-    scroll::Autoscroll,
-    DisplayPoint,
+    display_map::DisplaySnapshot, movement::TextLayoutDetails, scroll::Autoscroll, DisplayPoint,
 };
 use gpui::WindowContext;
 use language::{char_kind, CharKind, Selection};
@@ -24,7 +21,7 @@ pub fn change_motion(vim: &mut Vim, motion: Motion, times: Option<usize>, cx: &m
             | Motion::Backspace
             | Motion::StartOfLine { .. }
     );
-    vim.update_active_editor(cx, |editor, cx| {
+    vim.update_active_editor(cx, |vim, editor, cx| {
         let text_layout_details = editor.text_layout_details(cx);
         editor.transact(cx, |editor, cx| {
             // We are swapping to insert mode anyway. Just set the line end clipping behavior now
@@ -39,13 +36,23 @@ pub fn change_motion(vim: &mut Vim, motion: Motion, times: Option<usize>, cx: &m
                             times,
                             ignore_punctuation,
                             &text_layout_details,
+                            false,
+                        )
+                    } else if let Motion::NextSubwordStart { ignore_punctuation } = motion {
+                        expand_changed_word_selection(
+                            map,
+                            selection,
+                            times,
+                            ignore_punctuation,
+                            &text_layout_details,
+                            true,
                         )
                     } else {
                         motion.expand_selection(map, selection, times, false, &text_layout_details)
                     };
                 });
             });
-            copy_selections_content(editor, motion.linewise(), cx);
+            copy_selections_content(vim, editor, motion.linewise(), cx);
             editor.insert("", cx);
         });
     });
@@ -59,7 +66,7 @@ pub fn change_motion(vim: &mut Vim, motion: Motion, times: Option<usize>, cx: &m
 
 pub fn change_object(vim: &mut Vim, object: Object, around: bool, cx: &mut WindowContext) {
     let mut objects_found = false;
-    vim.update_active_editor(cx, |editor, cx| {
+    vim.update_active_editor(cx, |vim, editor, cx| {
         // We are swapping to insert mode anyway. Just set the line end clipping behavior now
         editor.set_clip_at_line_ends(false, cx);
         editor.transact(cx, |editor, cx| {
@@ -69,7 +76,7 @@ pub fn change_object(vim: &mut Vim, object: Object, around: bool, cx: &mut Windo
                 });
             });
             if objects_found {
-                copy_selections_content(editor, false, cx);
+                copy_selections_content(vim, editor, false, cx);
                 editor.insert("", cx);
             }
         });
@@ -94,6 +101,7 @@ fn expand_changed_word_selection(
     times: Option<usize>,
     ignore_punctuation: bool,
     text_layout_details: &TextLayoutDetails,
+    use_subword: bool,
 ) -> bool {
     if times.is_none() || times.unwrap() == 1 {
         let scope = map
@@ -106,32 +114,30 @@ fn expand_changed_word_selection(
             .unwrap_or_default();
 
         if in_word {
-            selection.end =
-                movement::find_boundary(map, selection.end, FindRange::MultiLine, |left, right| {
-                    let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
-                    let right_kind =
-                        coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
-
-                    left_kind != right_kind && left_kind != CharKind::Whitespace
-                });
+            if !use_subword {
+                selection.end =
+                    motion::next_word_end(map, selection.end, ignore_punctuation, 1, false);
+            } else {
+                selection.end =
+                    motion::next_subword_end(map, selection.end, ignore_punctuation, 1, false);
+            }
+            selection.end = motion::next_char(map, selection.end, false);
             true
         } else {
-            Motion::NextWordStart { ignore_punctuation }.expand_selection(
-                map,
-                selection,
-                None,
-                false,
-                &text_layout_details,
-            )
+            let motion = if use_subword {
+                Motion::NextSubwordStart { ignore_punctuation }
+            } else {
+                Motion::NextWordStart { ignore_punctuation }
+            };
+            motion.expand_selection(map, selection, None, false, &text_layout_details)
         }
     } else {
-        Motion::NextWordStart { ignore_punctuation }.expand_selection(
-            map,
-            selection,
-            times,
-            false,
-            &text_layout_details,
-        )
+        let motion = if use_subword {
+            Motion::NextSubwordStart { ignore_punctuation }
+        } else {
+            Motion::NextWordStart { ignore_punctuation }
+        };
+        motion.expand_selection(map, selection, times, false, &text_layout_details)
     }
 }
 

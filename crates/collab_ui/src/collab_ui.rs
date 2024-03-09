@@ -16,18 +16,23 @@ use gpui::{
     actions, point, AppContext, GlobalPixels, Pixels, PlatformDisplay, Size, Task, WindowBounds,
     WindowContext, WindowKind, WindowOptions,
 };
+use panel_settings::MessageEditorSettings;
 pub use panel_settings::{
     ChatPanelSettings, CollaborationPanelSettings, NotificationPanelSettings,
 };
 use settings::Settings;
 use workspace::{notifications::DetachAndPromptErr, AppState};
 
-actions!(collab, [ToggleScreenSharing, ToggleMute, LeaveCall]);
+actions!(
+    collab,
+    [ToggleScreenSharing, ToggleMute, ToggleDeafen, LeaveCall]
+);
 
 pub fn init(app_state: &Arc<AppState>, cx: &mut AppContext) {
     CollaborationPanelSettings::register(cx);
     ChatPanelSettings::register(cx);
     NotificationPanelSettings::register(cx);
+    MessageEditorSettings::register(cx);
 
     vcs_menu::init(cx);
     collab_titlebar_item::init(cx);
@@ -79,6 +84,12 @@ pub fn toggle_mute(_: &ToggleMute, cx: &mut AppContext) {
 
             room.toggle_mute(cx)
         });
+    }
+}
+
+pub fn toggle_deafen(_: &ToggleDeafen, cx: &mut AppContext) {
+    if let Some(room) = ActiveCall::global(cx).read(cx).room().cloned() {
+        room.update(cx, |room, cx| room.toggle_deafen(cx));
     }
 }
 

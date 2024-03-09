@@ -8,7 +8,7 @@ mod semantic_index_tests;
 
 use crate::semantic_index_settings::SemanticIndexSettings;
 use ai::embedding::{Embedding, EmbeddingProvider};
-use ai::providers::open_ai::OpenAiEmbeddingProvider;
+use ai::providers::open_ai::{OpenAiEmbeddingProvider, OPEN_AI_API_URL};
 use anyhow::{anyhow, Context as _, Result};
 use collections::{BTreeMap, HashMap, HashSet};
 use db::VectorDatabase;
@@ -91,8 +91,13 @@ pub fn init(
     .detach();
 
     cx.spawn(move |cx| async move {
-        let embedding_provider =
-            OpenAiEmbeddingProvider::new(http_client, cx.background_executor().clone()).await;
+        let embedding_provider = OpenAiEmbeddingProvider::new(
+            // TODO: We should read it from config, but I'm not sure whether to reuse `openai_api_url` in assistant settings or not
+            OPEN_AI_API_URL.to_string(),
+            http_client,
+            cx.background_executor().clone(),
+        )
+        .await;
         let semantic_index = SemanticIndex::new(
             fs,
             db_file_path,
@@ -324,7 +329,7 @@ impl SemanticIndex {
                 SemanticIndexStatus::Indexed
             } else {
                 SemanticIndexStatus::Indexing {
-                    remaining_files: project_state.pending_file_count_rx.borrow().clone(),
+                    remaining_files: *project_state.pending_file_count_rx.borrow(),
                     rate_limit_expiry: self.embedding_provider.rate_limit_expiration(),
                 }
             }
@@ -492,7 +497,7 @@ impl SemanticIndex {
         changes: Arc<[(Arc<Path>, ProjectEntryId, PathChange)]>,
         cx: &mut ModelContext<Self>,
     ) {
-        let Some(worktree) = project.read(cx).worktree_for_id(worktree_id.clone(), cx) else {
+        let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
             return;
         };
         let project = project.downgrade();
@@ -652,9 +657,9 @@ impl SemanticIndex {
                 if register.await.log_err().is_none() {
                     // Stop tracking this worktree if the registration failed.
                     this.update(&mut cx, |this, _| {
-                        this.projects.get_mut(&project).map(|project_state| {
+                        if let Some(project_state) = this.projects.get_mut(&project) {
                             project_state.worktrees.remove(&worktree_id);
-                        });
+                        }
                     })
                     .ok();
                 }
@@ -835,7 +840,6 @@ impl SemanticIndex {
             let mut batch_results = Vec::new();
             for batch in file_ids.chunks(batch_size) {
                 let batch = batch.into_iter().map(|v| *v).collect::<Vec<i64>>();
-                let limit = limit.clone();
                 let fs = fs.clone();
                 let db_path = db_path.clone();
                 let query = query.clone();

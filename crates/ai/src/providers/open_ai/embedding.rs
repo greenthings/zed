@@ -8,7 +8,6 @@ use gpui::BackgroundExecutor;
 use isahc::http::StatusCode;
 use isahc::prelude::Configurable;
 use isahc::{AsyncBody, Response};
-use lazy_static::lazy_static;
 use parking_lot::{Mutex, RwLock};
 use parse_duration::parse;
 use postage::watch;
@@ -16,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::env;
 use std::ops::Add;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use util::http::{HttpClient, Request};
@@ -29,12 +28,14 @@ use crate::providers::open_ai::OpenAiLanguageModel;
 
 use crate::providers::open_ai::OPEN_AI_API_URL;
 
-lazy_static! {
-    pub(crate) static ref OPEN_AI_BPE_TOKENIZER: CoreBPE = cl100k_base().unwrap();
+pub(crate) fn open_ai_bpe_tokenizer() -> &'static CoreBPE {
+    static OPEN_AI_BPE_TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+    OPEN_AI_BPE_TOKENIZER.get_or_init(|| cl100k_base().unwrap())
 }
 
 #[derive(Clone)]
 pub struct OpenAiEmbeddingProvider {
+    api_url: String,
     model: OpenAiLanguageModel,
     credential: Arc<RwLock<ProviderCredential>>,
     pub client: Arc<dyn HttpClient>,
@@ -69,7 +70,11 @@ struct OpenAiEmbeddingUsage {
 }
 
 impl OpenAiEmbeddingProvider {
-    pub async fn new(client: Arc<dyn HttpClient>, executor: BackgroundExecutor) -> Self {
+    pub async fn new(
+        api_url: String,
+        client: Arc<dyn HttpClient>,
+        executor: BackgroundExecutor,
+    ) -> Self {
         let (rate_limit_count_tx, rate_limit_count_rx) = watch::channel_with(None);
         let rate_limit_count_tx = Arc::new(Mutex::new(rate_limit_count_tx));
 
@@ -80,6 +85,7 @@ impl OpenAiEmbeddingProvider {
         let credential = Arc::new(RwLock::new(ProviderCredential::NoCredentials));
 
         OpenAiEmbeddingProvider {
+            api_url,
             model,
             credential,
             client,
@@ -130,11 +136,12 @@ impl OpenAiEmbeddingProvider {
     }
     async fn send_request(
         &self,
+        api_url: &str,
         api_key: &str,
         spans: Vec<&str>,
         request_timeout: u64,
     ) -> Result<Response<AsyncBody>> {
-        let request = Request::post(format!("{OPEN_AI_API_URL}/embeddings"))
+        let request = Request::post(format!("{api_url}/embeddings"))
             .redirect_policy(isahc::config::RedirectPolicy::Follow)
             .timeout(Duration::from_secs(request_timeout))
             .header("Content-Type", "application/json")
@@ -246,6 +253,7 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
         const BACKOFF_SECONDS: [usize; 4] = [3, 5, 15, 45];
         const MAX_RETRIES: usize = 4;
 
+        let api_url = self.api_url.as_str();
         let api_key = self.get_api_key()?;
 
         let mut request_number = 0;
@@ -255,6 +263,7 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
         while request_number < MAX_RETRIES {
             response = self
                 .send_request(
+                    &api_url,
                     &api_key,
                     spans.iter().map(|x| &**x).collect(),
                     request_timeout,

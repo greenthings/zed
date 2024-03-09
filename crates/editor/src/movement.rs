@@ -5,13 +5,14 @@ use super::{Bias, DisplayPoint, DisplaySnapshot, SelectionGoal, ToDisplayPoint};
 use crate::{char_kind, scroll::ScrollAnchor, CharKind, EditorStyle, ToOffset, ToPoint};
 use gpui::{px, Pixels, WindowTextSystem};
 use language::Point;
+use multi_buffer::MultiBufferSnapshot;
 
 use std::{ops::Range, sync::Arc};
 
 /// Defines search strategy for items in `movement` module.
 /// `FindRange::SingeLine` only looks for a match on a single line at a time, whereas
 /// `FindRange::MultiLine` keeps going until the end of a string.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FindRange {
     SingleLine,
     MultiLine,
@@ -254,7 +255,7 @@ pub fn previous_word_start(map: &DisplaySnapshot, point: DisplayPoint) -> Displa
     let raw_point = point.to_point(map);
     let scope = map.buffer_snapshot.language_scope_at(raw_point);
 
-    find_preceding_boundary(map, point, FindRange::MultiLine, |left, right| {
+    find_preceding_boundary_display_point(map, point, FindRange::MultiLine, |left, right| {
         (char_kind(&scope, left) != char_kind(&scope, right) && !right.is_whitespace())
             || left == '\n'
     })
@@ -267,7 +268,7 @@ pub fn previous_subword_start(map: &DisplaySnapshot, point: DisplayPoint) -> Dis
     let raw_point = point.to_point(map);
     let scope = map.buffer_snapshot.language_scope_at(raw_point);
 
-    find_preceding_boundary(map, point, FindRange::MultiLine, |left, right| {
+    find_preceding_boundary_display_point(map, point, FindRange::MultiLine, |left, right| {
         let is_word_start =
             char_kind(&scope, left) != char_kind(&scope, right) && !right.is_whitespace();
         let is_subword_start =
@@ -366,16 +367,16 @@ pub fn end_of_paragraph(
 /// indicated by the given predicate returning true.
 /// The predicate is called with the character to the left and right of the candidate boundary location.
 /// If FindRange::SingleLine is specified and no boundary is found before the start of the current line, the start of the current line will be returned.
-pub fn find_preceding_boundary(
-    map: &DisplaySnapshot,
-    from: DisplayPoint,
+pub fn find_preceding_boundary_point(
+    buffer_snapshot: &MultiBufferSnapshot,
+    from: Point,
     find_range: FindRange,
     mut is_boundary: impl FnMut(char, char) -> bool,
-) -> DisplayPoint {
+) -> Point {
     let mut prev_ch = None;
-    let mut offset = from.to_point(map).to_offset(&map.buffer_snapshot);
+    let mut offset = from.to_offset(&buffer_snapshot);
 
-    for ch in map.buffer_snapshot.reversed_chars_at(offset) {
+    for ch in buffer_snapshot.reversed_chars_at(offset) {
         if find_range == FindRange::SingleLine && ch == '\n' {
             break;
         }
@@ -389,7 +390,26 @@ pub fn find_preceding_boundary(
         prev_ch = Some(ch);
     }
 
-    map.clip_point(offset.to_display_point(map), Bias::Left)
+    offset.to_point(&buffer_snapshot)
+}
+
+/// Scans for a boundary preceding the given start point `from` until a boundary is found,
+/// indicated by the given predicate returning true.
+/// The predicate is called with the character to the left and right of the candidate boundary location.
+/// If FindRange::SingleLine is specified and no boundary is found before the start of the current line, the start of the current line will be returned.
+pub fn find_preceding_boundary_display_point(
+    map: &DisplaySnapshot,
+    from: DisplayPoint,
+    find_range: FindRange,
+    is_boundary: impl FnMut(char, char) -> bool,
+) -> DisplayPoint {
+    let result = find_preceding_boundary_point(
+        &map.buffer_snapshot,
+        from.to_point(map),
+        find_range,
+        is_boundary,
+    );
+    map.clip_point(result.to_display_point(map), Bias::Left)
 }
 
 /// Scans for a boundary following the given start point until a boundary is found, indicated by the
@@ -626,7 +646,7 @@ mod tests {
         ) {
             let (snapshot, display_points) = marked_display_snapshot(marked_text, cx);
             assert_eq!(
-                find_preceding_boundary(
+                find_preceding_boundary_display_point(
                     &snapshot,
                     display_points[1],
                     FindRange::MultiLine,
@@ -668,31 +688,30 @@ mod tests {
         // add all kinds of inlays between two word boundaries: we should be able to cross them all, when looking for another boundary
         let mut id = 0;
         let inlays = (0..buffer_snapshot.len())
-            .map(|offset| {
+            .flat_map(|offset| {
                 [
                     Inlay {
                         id: InlayId::Suggestion(post_inc(&mut id)),
                         position: buffer_snapshot.anchor_at(offset, Bias::Left),
-                        text: format!("test").into(),
+                        text: "test".into(),
                     },
                     Inlay {
                         id: InlayId::Suggestion(post_inc(&mut id)),
                         position: buffer_snapshot.anchor_at(offset, Bias::Right),
-                        text: format!("test").into(),
+                        text: "test".into(),
                     },
                     Inlay {
                         id: InlayId::Hint(post_inc(&mut id)),
                         position: buffer_snapshot.anchor_at(offset, Bias::Left),
-                        text: format!("test").into(),
+                        text: "test".into(),
                     },
                     Inlay {
                         id: InlayId::Hint(post_inc(&mut id)),
                         position: buffer_snapshot.anchor_at(offset, Bias::Right),
-                        text: format!("test").into(),
+                        text: "test".into(),
                     },
                 ]
             })
-            .flatten()
             .collect();
         let snapshot = display_map.update(cx, |map, cx| {
             map.splice_inlays(Vec::new(), inlays, cx);
@@ -700,7 +719,7 @@ mod tests {
         });
 
         assert_eq!(
-            find_preceding_boundary(
+            find_preceding_boundary_display_point(
                 &snapshot,
                 buffer_snapshot.len().to_display_point(&snapshot),
                 FindRange::MultiLine,
@@ -821,7 +840,7 @@ mod tests {
                 surrounding_word(&snapshot, display_points[1]),
                 display_points[0]..display_points[2],
                 "{}",
-                marked_text.to_string()
+                marked_text
             );
         }
 
@@ -843,7 +862,7 @@ mod tests {
 
         let mut cx = EditorTestContext::new(cx).await;
         let editor = cx.editor.clone();
-        let window = cx.window.clone();
+        let window = cx.window;
         _ = cx.update_window(window, |_, cx| {
             let text_layout_details =
                 editor.update(cx, |editor, cx| editor.text_layout_details(cx));

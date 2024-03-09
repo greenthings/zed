@@ -1,6 +1,8 @@
 use editor::{
     display_map::{DisplaySnapshot, FoldPoint, ToDisplayPoint},
-    movement::{self, find_boundary, find_preceding_boundary, FindRange, TextLayoutDetails},
+    movement::{
+        self, find_boundary, find_preceding_boundary_display_point, FindRange, TextLayoutDetails,
+    },
     Bias, DisplayPoint, ToOffset,
 };
 use gpui::{actions, impl_actions, px, ViewContext, WindowContext};
@@ -20,26 +22,71 @@ use crate::{
 pub enum Motion {
     Left,
     Backspace,
-    Down { display_lines: bool },
-    Up { display_lines: bool },
+    Down {
+        display_lines: bool,
+    },
+    Up {
+        display_lines: bool,
+    },
     Right,
     Space,
-    NextWordStart { ignore_punctuation: bool },
-    NextWordEnd { ignore_punctuation: bool },
-    PreviousWordStart { ignore_punctuation: bool },
-    FirstNonWhitespace { display_lines: bool },
+    NextWordStart {
+        ignore_punctuation: bool,
+    },
+    NextWordEnd {
+        ignore_punctuation: bool,
+    },
+    PreviousWordStart {
+        ignore_punctuation: bool,
+    },
+    PreviousWordEnd {
+        ignore_punctuation: bool,
+    },
+    NextSubwordStart {
+        ignore_punctuation: bool,
+    },
+    NextSubwordEnd {
+        ignore_punctuation: bool,
+    },
+    PreviousSubwordStart {
+        ignore_punctuation: bool,
+    },
+    PreviousSubwordEnd {
+        ignore_punctuation: bool,
+    },
+    FirstNonWhitespace {
+        display_lines: bool,
+    },
     CurrentLine,
-    StartOfLine { display_lines: bool },
-    EndOfLine { display_lines: bool },
+    StartOfLine {
+        display_lines: bool,
+    },
+    EndOfLine {
+        display_lines: bool,
+    },
     StartOfParagraph,
     EndOfParagraph,
     StartOfDocument,
     EndOfDocument,
     Matching,
-    FindForward { before: bool, char: char },
-    FindBackward { after: bool, char: char },
-    RepeatFind { last_find: Box<Motion> },
-    RepeatFindReversed { last_find: Box<Motion> },
+    FindForward {
+        before: bool,
+        char: char,
+        mode: FindRange,
+        smartcase: bool,
+    },
+    FindBackward {
+        after: bool,
+        char: char,
+        mode: FindRange,
+        smartcase: bool,
+    },
+    RepeatFind {
+        last_find: Box<Motion>,
+    },
+    RepeatFindReversed {
+        last_find: Box<Motion>,
+    },
     NextLineStart,
     StartOfLineDownward,
     EndOfLineDownward,
@@ -68,6 +115,41 @@ struct NextWordEnd {
 struct PreviousWordStart {
     #[serde(default)]
     ignore_punctuation: bool,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PreviousWordEnd {
+    #[serde(default)]
+    ignore_punctuation: bool,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NextSubwordStart {
+    #[serde(default)]
+    pub(crate) ignore_punctuation: bool,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NextSubwordEnd {
+    #[serde(default)]
+    pub(crate) ignore_punctuation: bool,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreviousSubwordStart {
+    #[serde(default)]
+    pub(crate) ignore_punctuation: bool,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreviousSubwordEnd {
+    #[serde(default)]
+    pub(crate) ignore_punctuation: bool,
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
@@ -113,9 +195,14 @@ impl_actions!(
         FirstNonWhitespace,
         Down,
         Up,
-        PreviousWordStart,
+        NextWordStart,
         NextWordEnd,
-        NextWordStart
+        PreviousWordStart,
+        PreviousWordEnd,
+        NextSubwordStart,
+        NextSubwordEnd,
+        PreviousSubwordStart,
+        PreviousSubwordEnd,
     ]
 );
 
@@ -223,6 +310,31 @@ pub fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
          &PreviousWordStart { ignore_punctuation }: &PreviousWordStart,
          cx: _| { motion(Motion::PreviousWordStart { ignore_punctuation }, cx) },
     );
+    workspace.register_action(
+        |_: &mut Workspace, &PreviousWordEnd { ignore_punctuation }, cx: _| {
+            motion(Motion::PreviousWordEnd { ignore_punctuation }, cx)
+        },
+    );
+    workspace.register_action(
+        |_: &mut Workspace, &NextSubwordStart { ignore_punctuation }: &NextSubwordStart, cx: _| {
+            motion(Motion::NextSubwordStart { ignore_punctuation }, cx)
+        },
+    );
+    workspace.register_action(
+        |_: &mut Workspace, &NextSubwordEnd { ignore_punctuation }: &NextSubwordEnd, cx: _| {
+            motion(Motion::NextSubwordEnd { ignore_punctuation }, cx)
+        },
+    );
+    workspace.register_action(
+        |_: &mut Workspace,
+         &PreviousSubwordStart { ignore_punctuation }: &PreviousSubwordStart,
+         cx: _| { motion(Motion::PreviousSubwordStart { ignore_punctuation }, cx) },
+    );
+    workspace.register_action(
+        |_: &mut Workspace, &PreviousSubwordEnd { ignore_punctuation }, cx: _| {
+            motion(Motion::PreviousSubwordEnd { ignore_punctuation }, cx)
+        },
+    );
     workspace.register_action(|_: &mut Workspace, &NextLineStart, cx: _| {
         motion(Motion::NextLineStart, cx)
     });
@@ -303,7 +415,6 @@ impl Motion {
             | WindowBottom
             | EndOfParagraph => true,
             EndOfLine { .. }
-            | NextWordEnd { .. }
             | Matching
             | FindForward { .. }
             | Left
@@ -314,7 +425,13 @@ impl Motion {
             | EndOfLineDownward
             | GoToColumn
             | NextWordStart { .. }
+            | NextWordEnd { .. }
             | PreviousWordStart { .. }
+            | PreviousWordEnd { .. }
+            | NextSubwordStart { .. }
+            | NextSubwordEnd { .. }
+            | PreviousSubwordStart { .. }
+            | PreviousSubwordEnd { .. }
             | FirstNonWhitespace { .. }
             | FindBackward { .. }
             | RepeatFind { .. }
@@ -329,7 +446,6 @@ impl Motion {
             Down { .. }
             | Up { .. }
             | EndOfLine { .. }
-            | NextWordEnd { .. }
             | Matching
             | FindForward { .. }
             | RepeatFind { .. }
@@ -344,7 +460,13 @@ impl Motion {
             | EndOfLineDownward
             | GoToColumn
             | NextWordStart { .. }
+            | NextWordEnd { .. }
             | PreviousWordStart { .. }
+            | PreviousWordEnd { .. }
+            | NextSubwordStart { .. }
+            | NextSubwordEnd { .. }
+            | PreviousSubwordStart { .. }
+            | PreviousSubwordEnd { .. }
             | FirstNonWhitespace { .. }
             | FindBackward { .. }
             | RepeatFindReversed { .. }
@@ -365,12 +487,15 @@ impl Motion {
             | CurrentLine
             | EndOfLine { .. }
             | EndOfLineDownward
-            | NextWordEnd { .. }
             | Matching
             | FindForward { .. }
             | WindowTop
             | WindowMiddle
             | WindowBottom
+            | NextWordEnd { .. }
+            | PreviousWordEnd { .. }
+            | NextSubwordEnd { .. }
+            | PreviousSubwordEnd { .. }
             | NextLineStart => true,
             Left
             | Backspace
@@ -383,6 +508,8 @@ impl Motion {
             | GoToColumn
             | NextWordStart { .. }
             | PreviousWordStart { .. }
+            | NextSubwordStart { .. }
+            | PreviousSubwordStart { .. }
             | FirstNonWhitespace { .. }
             | FindBackward { .. } => false,
             RepeatFind { last_find: motion } | RepeatFindReversed { last_find: motion } => {
@@ -424,11 +551,31 @@ impl Motion {
                 SelectionGoal::None,
             ),
             NextWordEnd { ignore_punctuation } => (
-                next_word_end(map, point, *ignore_punctuation, times),
+                next_word_end(map, point, *ignore_punctuation, times, true),
                 SelectionGoal::None,
             ),
             PreviousWordStart { ignore_punctuation } => (
                 previous_word_start(map, point, *ignore_punctuation, times),
+                SelectionGoal::None,
+            ),
+            PreviousWordEnd { ignore_punctuation } => (
+                previous_word_end(map, point, *ignore_punctuation, times),
+                SelectionGoal::None,
+            ),
+            NextSubwordStart { ignore_punctuation } => (
+                next_subword_start(map, point, *ignore_punctuation, times),
+                SelectionGoal::None,
+            ),
+            NextSubwordEnd { ignore_punctuation } => (
+                next_subword_end(map, point, *ignore_punctuation, times, true),
+                SelectionGoal::None,
+            ),
+            PreviousSubwordStart { ignore_punctuation } => (
+                previous_subword_start(map, point, *ignore_punctuation, times),
+                SelectionGoal::None,
+            ),
+            PreviousSubwordEnd { ignore_punctuation } => (
+                previous_subword_end(map, point, *ignore_punctuation, times),
                 SelectionGoal::None,
             ),
             FirstNonWhitespace { display_lines } => (
@@ -439,9 +586,10 @@ impl Motion {
                 start_of_line(map, *display_lines, point),
                 SelectionGoal::None,
             ),
-            EndOfLine { display_lines } => {
-                (end_of_line(map, *display_lines, point), SelectionGoal::None)
-            }
+            EndOfLine { display_lines } => (
+                end_of_line(map, *display_lines, point, times),
+                SelectionGoal::None,
+            ),
             StartOfParagraph => (
                 movement::start_of_paragraph(map, point, times),
                 SelectionGoal::None,
@@ -458,30 +606,54 @@ impl Motion {
             ),
             Matching => (matching(map, point), SelectionGoal::None),
             // t f
-            FindForward { before, char } => {
-                return find_forward(map, point, *before, *char, times)
+            FindForward {
+                before,
+                char,
+                mode,
+                smartcase,
+            } => {
+                return find_forward(map, point, *before, *char, times, *mode, *smartcase)
                     .map(|new_point| (new_point, SelectionGoal::None))
             }
             // T F
-            FindBackward { after, char } => (
-                find_backward(map, point, *after, *char, times),
+            FindBackward {
+                after,
+                char,
+                mode,
+                smartcase,
+            } => (
+                find_backward(map, point, *after, *char, times, *mode, *smartcase),
                 SelectionGoal::None,
             ),
             // ; -- repeat the last find done with t, f, T, F
             RepeatFind { last_find } => match **last_find {
-                Motion::FindForward { before, char } => {
-                    let mut new_point = find_forward(map, point, before, char, times);
+                Motion::FindForward {
+                    before,
+                    char,
+                    mode,
+                    smartcase,
+                } => {
+                    let mut new_point =
+                        find_forward(map, point, before, char, times, mode, smartcase);
                     if new_point == Some(point) {
-                        new_point = find_forward(map, point, before, char, times + 1);
+                        new_point =
+                            find_forward(map, point, before, char, times + 1, mode, smartcase);
                     }
 
                     return new_point.map(|new_point| (new_point, SelectionGoal::None));
                 }
 
-                Motion::FindBackward { after, char } => {
-                    let mut new_point = find_backward(map, point, after, char, times);
+                Motion::FindBackward {
+                    after,
+                    char,
+                    mode,
+                    smartcase,
+                } => {
+                    let mut new_point =
+                        find_backward(map, point, after, char, times, mode, smartcase);
                     if new_point == point {
-                        new_point = find_backward(map, point, after, char, times + 1);
+                        new_point =
+                            find_backward(map, point, after, char, times + 1, mode, smartcase);
                     }
 
                     (new_point, SelectionGoal::None)
@@ -490,19 +662,33 @@ impl Motion {
             },
             // , -- repeat the last find done with t, f, T, F, in opposite direction
             RepeatFindReversed { last_find } => match **last_find {
-                Motion::FindForward { before, char } => {
-                    let mut new_point = find_backward(map, point, before, char, times);
+                Motion::FindForward {
+                    before,
+                    char,
+                    mode,
+                    smartcase,
+                } => {
+                    let mut new_point =
+                        find_backward(map, point, before, char, times, mode, smartcase);
                     if new_point == point {
-                        new_point = find_backward(map, point, before, char, times + 1);
+                        new_point =
+                            find_backward(map, point, before, char, times + 1, mode, smartcase);
                     }
 
                     (new_point, SelectionGoal::None)
                 }
 
-                Motion::FindBackward { after, char } => {
-                    let mut new_point = find_forward(map, point, after, char, times);
+                Motion::FindBackward {
+                    after,
+                    char,
+                    mode,
+                    smartcase,
+                } => {
+                    let mut new_point =
+                        find_forward(map, point, after, char, times, mode, smartcase);
                     if new_point == Some(point) {
-                        new_point = find_forward(map, point, after, char, times + 1);
+                        new_point =
+                            find_forward(map, point, after, char, times + 1, mode, smartcase);
                     }
 
                     return new_point.map(|new_point| (new_point, SelectionGoal::None));
@@ -765,6 +951,25 @@ pub(crate) fn right(map: &DisplaySnapshot, mut point: DisplayPoint, times: usize
     point
 }
 
+pub(crate) fn next_char(
+    map: &DisplaySnapshot,
+    point: DisplayPoint,
+    allow_cross_newline: bool,
+) -> DisplayPoint {
+    let mut new_point = point;
+    let mut max_column = map.line_len(new_point.row());
+    if !allow_cross_newline {
+        max_column -= 1;
+    }
+    if new_point.column() < max_column {
+        *new_point.column_mut() += 1;
+    } else if new_point < map.max_point() && allow_cross_newline {
+        *new_point.row_mut() += 1;
+        *new_point.column_mut() = 0;
+    }
+    new_point
+}
+
 pub(crate) fn next_word_start(
     map: &DisplaySnapshot,
     mut point: DisplayPoint,
@@ -794,22 +999,17 @@ pub(crate) fn next_word_start(
     point
 }
 
-fn next_word_end(
+pub(crate) fn next_word_end(
     map: &DisplaySnapshot,
     mut point: DisplayPoint,
     ignore_punctuation: bool,
     times: usize,
+    allow_cross_newline: bool,
 ) -> DisplayPoint {
     let scope = map.buffer_snapshot.language_scope_at(point.to_point(map));
     for _ in 0..times {
-        let mut new_point = point;
-        if new_point.column() < map.line_len(new_point.row()) {
-            *new_point.column_mut() += 1;
-        } else if new_point.row() < map.max_buffer_row() {
-            *new_point.row_mut() += 1;
-            *new_point.column_mut() = 0;
-        }
-
+        let new_point = next_char(map, point, allow_cross_newline);
+        let mut need_next_char = false;
         let new_point = movement::find_boundary_exclusive(
             map,
             new_point,
@@ -817,10 +1017,21 @@ fn next_word_end(
             |left, right| {
                 let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
                 let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+                let at_newline = right == '\n';
+
+                if !allow_cross_newline && at_newline {
+                    need_next_char = true;
+                    return true;
+                }
 
                 left_kind != right_kind && left_kind != CharKind::Whitespace
             },
         );
+        let new_point = if need_next_char {
+            next_char(map, new_point, true)
+        } else {
+            new_point
+        };
         let new_point = map.clip_point(new_point, Bias::Left);
         if point == new_point {
             break;
@@ -840,19 +1051,227 @@ fn previous_word_start(
     for _ in 0..times {
         // This works even though find_preceding_boundary is called for every character in the line containing
         // cursor because the newline is checked only once.
-        let new_point =
-            movement::find_preceding_boundary(map, point, FindRange::MultiLine, |left, right| {
+        let new_point = movement::find_preceding_boundary_display_point(
+            map,
+            point,
+            FindRange::MultiLine,
+            |left, right| {
                 let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
                 let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
 
                 (left_kind != right_kind && !right.is_whitespace()) || left == '\n'
-            });
+            },
+        );
         if point == new_point {
             break;
         }
         point = new_point;
     }
     point
+}
+
+fn previous_word_end(
+    map: &DisplaySnapshot,
+    point: DisplayPoint,
+    ignore_punctuation: bool,
+    times: usize,
+) -> DisplayPoint {
+    let scope = map.buffer_snapshot.language_scope_at(point.to_point(map));
+    let mut point = point.to_point(map);
+
+    if point.column < map.buffer_snapshot.line_len(point.row) {
+        point.column += 1;
+    }
+    for _ in 0..times {
+        let new_point = movement::find_preceding_boundary_point(
+            &map.buffer_snapshot,
+            point,
+            FindRange::MultiLine,
+            |left, right| {
+                let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
+                let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+                match (left_kind, right_kind) {
+                    (CharKind::Punctuation, CharKind::Whitespace)
+                    | (CharKind::Punctuation, CharKind::Word)
+                    | (CharKind::Word, CharKind::Whitespace)
+                    | (CharKind::Word, CharKind::Punctuation) => true,
+                    (CharKind::Whitespace, CharKind::Whitespace) => left == '\n' && right == '\n',
+                    _ => false,
+                }
+            },
+        );
+        if new_point == point {
+            break;
+        }
+        point = new_point;
+    }
+    movement::saturating_left(map, point.to_display_point(map))
+}
+
+fn next_subword_start(
+    map: &DisplaySnapshot,
+    mut point: DisplayPoint,
+    ignore_punctuation: bool,
+    times: usize,
+) -> DisplayPoint {
+    let scope = map.buffer_snapshot.language_scope_at(point.to_point(map));
+    for _ in 0..times {
+        let mut crossed_newline = false;
+        let new_point = movement::find_boundary(map, point, FindRange::MultiLine, |left, right| {
+            let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
+            let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+            let at_newline = right == '\n';
+
+            let is_word_start = (left_kind != right_kind) && !left.is_alphanumeric();
+            let is_subword_start =
+                left == '_' && right != '_' || left.is_lowercase() && right.is_uppercase();
+
+            let found = (!right.is_whitespace() && (is_word_start || is_subword_start))
+                || at_newline && crossed_newline
+                || at_newline && left == '\n'; // Prevents skipping repeated empty lines
+
+            crossed_newline |= at_newline;
+            found
+        });
+        if point == new_point {
+            break;
+        }
+        point = new_point;
+    }
+    point
+}
+
+pub(crate) fn next_subword_end(
+    map: &DisplaySnapshot,
+    mut point: DisplayPoint,
+    ignore_punctuation: bool,
+    times: usize,
+    allow_cross_newline: bool,
+) -> DisplayPoint {
+    let scope = map.buffer_snapshot.language_scope_at(point.to_point(map));
+    for _ in 0..times {
+        let new_point = next_char(map, point, allow_cross_newline);
+
+        let mut crossed_newline = false;
+        let mut need_backtrack = false;
+        let new_point =
+            movement::find_boundary(map, new_point, FindRange::MultiLine, |left, right| {
+                let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
+                let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+                let at_newline = right == '\n';
+
+                if !allow_cross_newline && at_newline {
+                    return true;
+                }
+
+                let is_word_end = (left_kind != right_kind) && !right.is_alphanumeric();
+                let is_subword_end =
+                    left != '_' && right == '_' || left.is_lowercase() && right.is_uppercase();
+
+                let found = !left.is_whitespace() && !at_newline && (is_word_end || is_subword_end);
+
+                if found && (is_word_end || is_subword_end) {
+                    need_backtrack = true;
+                }
+
+                crossed_newline |= at_newline;
+                found
+            });
+        let mut new_point = map.clip_point(new_point, Bias::Left);
+        if need_backtrack {
+            *new_point.column_mut() -= 1;
+        }
+        if point == new_point {
+            break;
+        }
+        point = new_point;
+    }
+    point
+}
+
+fn previous_subword_start(
+    map: &DisplaySnapshot,
+    mut point: DisplayPoint,
+    ignore_punctuation: bool,
+    times: usize,
+) -> DisplayPoint {
+    let scope = map.buffer_snapshot.language_scope_at(point.to_point(map));
+    for _ in 0..times {
+        let mut crossed_newline = false;
+        // This works even though find_preceding_boundary is called for every character in the line containing
+        // cursor because the newline is checked only once.
+        let new_point = movement::find_preceding_boundary_display_point(
+            map,
+            point,
+            FindRange::MultiLine,
+            |left, right| {
+                let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
+                let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+                let at_newline = right == '\n';
+
+                let is_word_start = (left_kind != right_kind) && !left.is_alphanumeric();
+                let is_subword_start =
+                    left == '_' && right != '_' || left.is_lowercase() && right.is_uppercase();
+
+                let found = (!right.is_whitespace() && (is_word_start || is_subword_start))
+                    || at_newline && crossed_newline
+                    || at_newline && left == '\n'; // Prevents skipping repeated empty lines
+
+                crossed_newline |= at_newline;
+
+                found
+            },
+        );
+        if point == new_point {
+            break;
+        }
+        point = new_point;
+    }
+    point
+}
+
+fn previous_subword_end(
+    map: &DisplaySnapshot,
+    point: DisplayPoint,
+    ignore_punctuation: bool,
+    times: usize,
+) -> DisplayPoint {
+    let scope = map.buffer_snapshot.language_scope_at(point.to_point(map));
+    let mut point = point.to_point(map);
+
+    if point.column < map.buffer_snapshot.line_len(point.row) {
+        point.column += 1;
+    }
+    for _ in 0..times {
+        let new_point = movement::find_preceding_boundary_point(
+            &map.buffer_snapshot,
+            point,
+            FindRange::MultiLine,
+            |left, right| {
+                let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
+                let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+
+                let is_subword_end =
+                    left != '_' && right == '_' || left.is_lowercase() && right.is_uppercase();
+
+                if is_subword_end {
+                    return true;
+                }
+
+                match (left_kind, right_kind) {
+                    (CharKind::Word, CharKind::Whitespace)
+                    | (CharKind::Word, CharKind::Punctuation) => true,
+                    (CharKind::Whitespace, CharKind::Whitespace) => left == '\n' && right == '\n',
+                    _ => false,
+                }
+            },
+        );
+        if new_point == point {
+            break;
+        }
+        point = new_point;
+    }
+    movement::saturating_left(map, point.to_display_point(map))
 }
 
 pub(crate) fn first_non_whitespace(
@@ -892,8 +1311,12 @@ pub(crate) fn start_of_line(
 pub(crate) fn end_of_line(
     map: &DisplaySnapshot,
     display_lines: bool,
-    point: DisplayPoint,
+    mut point: DisplayPoint,
+    times: usize,
 ) -> DisplayPoint {
+    if times > 1 {
+        point = start_of_relative_buffer_row(map, point, times as isize - 1);
+    }
     if display_lines {
         map.clip_point(
             DisplayPoint::new(point.row(), map.line_len(point.row())),
@@ -984,14 +1407,16 @@ fn find_forward(
     before: bool,
     target: char,
     times: usize,
+    mode: FindRange,
+    smartcase: bool,
 ) -> Option<DisplayPoint> {
     let mut to = from;
     let mut found = false;
 
     for _ in 0..times {
         found = false;
-        let new_to = find_boundary(map, to, FindRange::SingleLine, |_, right| {
-            found = right == target;
+        let new_to = find_boundary(map, to, mode, |_, right| {
+            found = is_character_match(target, right, smartcase);
             found
         });
         if to == new_to {
@@ -1018,19 +1443,23 @@ fn find_backward(
     after: bool,
     target: char,
     times: usize,
+    mode: FindRange,
+    smartcase: bool,
 ) -> DisplayPoint {
     let mut to = from;
 
     for _ in 0..times {
-        let new_to =
-            find_preceding_boundary(map, to, FindRange::SingleLine, |_, right| right == target);
+        let new_to = find_preceding_boundary_display_point(map, to, mode, |_, right| {
+            is_character_match(target, right, smartcase)
+        });
         if to == new_to {
             break;
         }
         to = new_to;
     }
 
-    if map.buffer_snapshot.chars_at(to.to_point(map)).next() == Some(target) {
+    let next = map.buffer_snapshot.chars_at(to.to_point(map)).next();
+    if next.is_some() && is_character_match(target, next.unwrap(), smartcase) {
         if after {
             *to.column_mut() += 1;
             map.clip_point(to, Bias::Right)
@@ -1039,6 +1468,18 @@ fn find_backward(
         }
     } else {
         from
+    }
+}
+
+fn is_character_match(target: char, other: char, smartcase: bool) -> bool {
+    if smartcase {
+        if target.is_uppercase() {
+            target == other
+        } else {
+            target == other.to_ascii_lowercase()
+        }
+    } else {
+        target == other
     }
 }
 
@@ -1060,7 +1501,7 @@ pub(crate) fn next_line_end(
     if times > 1 {
         point = start_of_relative_buffer_row(map, point, times as isize - 1);
     }
-    end_of_line(map, false, point)
+    end_of_line(map, false, point, 1)
 }
 
 fn window_top(
@@ -1081,13 +1522,15 @@ fn window_top(
 
     if let Some(visible_rows) = text_layout_details.visible_rows {
         let bottom_row = first_visible_line.row() + visible_rows as u32;
-        let new_row = (first_visible_line.row() + (times as u32)).min(bottom_row);
+        let new_row = (first_visible_line.row() + (times as u32))
+            .min(bottom_row)
+            .min(map.max_point().row());
         let new_col = point.column().min(map.line_len(first_visible_line.row()));
 
         let new_point = DisplayPoint::new(new_row, new_col);
         (map.clip_point(new_point, Bias::Left), SelectionGoal::None)
     } else {
-        let new_row = first_visible_line.row() + (times as u32);
+        let new_row = (first_visible_line.row() + (times as u32)).min(map.max_point().row());
         let new_col = point.column().min(map.line_len(first_visible_line.row()));
 
         let new_point = DisplayPoint::new(new_row, new_col);
@@ -1105,8 +1548,12 @@ fn window_middle(
             .scroll_anchor
             .anchor
             .to_display_point(map);
-        let max_rows = (visible_rows as u32).min(map.max_buffer_row());
-        let new_row = first_visible_line.row() + (max_rows.div_euclid(2));
+
+        let max_visible_rows =
+            (visible_rows as u32).min(map.max_point().row() - first_visible_line.row());
+
+        let new_row =
+            (first_visible_line.row() + (max_visible_rows / 2)).min(map.max_point().row());
         let new_col = point.column().min(map.line_len(new_row));
         let new_point = DisplayPoint::new(new_row, new_col);
         (map.clip_point(new_point, Bias::Left), SelectionGoal::None)
@@ -1128,12 +1575,12 @@ fn window_bottom(
             .to_display_point(map);
         let bottom_row = first_visible_line.row()
             + (visible_rows + text_layout_details.scroll_anchor.offset.y - 1.).floor() as u32;
-        if bottom_row < map.max_buffer_row()
+        if bottom_row < map.max_point().row()
             && text_layout_details.vertical_scroll_margin as usize > times
         {
             times = text_layout_details.vertical_scroll_margin.ceil() as usize;
         }
-        let bottom_row_capped = bottom_row.min(map.max_buffer_row());
+        let bottom_row_capped = bottom_row.min(map.max_point().row());
         let new_row = if bottom_row_capped.saturating_sub(times as u32) < first_visible_line.row() {
             first_visible_line.row()
         } else {
@@ -1562,6 +2009,100 @@ mod test {
           4 5 6
           7 8 9
           "})
+            .await;
+    }
+
+    #[gpui::test]
+    async fn test_previous_word_end(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {r"
+        456 5ˇ67 678
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["g", "e"]).await;
+        cx.assert_shared_state(indoc! {r"
+        45ˇ6 567 678
+        "})
+            .await;
+
+        // Test times
+        cx.set_shared_state(indoc! {r"
+        123 234 345
+        456 5ˇ67 678
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["4", "g", "e"]).await;
+        cx.assert_shared_state(indoc! {r"
+        12ˇ3 234 345
+        456 567 678
+        "})
+            .await;
+
+        // With punctuation
+        cx.set_shared_state(indoc! {r"
+        123 234 345
+        4;5.6 5ˇ67 678
+        789 890 901
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["g", "e"]).await;
+        cx.assert_shared_state(indoc! {r"
+          123 234 345
+          4;5.ˇ6 567 678
+          789 890 901
+        "})
+            .await;
+
+        // With punctuation and count
+        cx.set_shared_state(indoc! {r"
+        123 234 345
+        4;5.6 5ˇ67 678
+        789 890 901
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["5", "g", "e"]).await;
+        cx.assert_shared_state(indoc! {r"
+          123 234 345
+          ˇ4;5.6 567 678
+          789 890 901
+        "})
+            .await;
+
+        // newlines
+        cx.set_shared_state(indoc! {r"
+        123 234 345
+
+        78ˇ9 890 901
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["g", "e"]).await;
+        cx.assert_shared_state(indoc! {r"
+          123 234 345
+          ˇ
+          789 890 901
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["g", "e"]).await;
+        cx.assert_shared_state(indoc! {r"
+          123 234 34ˇ5
+
+          789 890 901
+        "})
+            .await;
+
+        // With punctuation
+        cx.set_shared_state(indoc! {r"
+        123 234 345
+        4;5.ˇ6 567 678
+        789 890 901
+        "})
+            .await;
+        cx.simulate_shared_keystrokes(["g", "shift-e"]).await;
+        cx.assert_shared_state(indoc! {r"
+          123 234 34ˇ5
+          4;5.6 567 678
+          789 890 901
+        "})
             .await;
     }
 }

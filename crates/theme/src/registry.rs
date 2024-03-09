@@ -12,9 +12,8 @@ use refineable::Refineable;
 use util::ResultExt;
 
 use crate::{
-    try_parse_color, Appearance, AppearanceContent, PlayerColor, PlayerColors, StatusColors,
-    SyntaxTheme, SystemColors, Theme, ThemeColors, ThemeContent, ThemeFamily, ThemeFamilyContent,
-    ThemeStyles,
+    try_parse_color, Appearance, AppearanceContent, PlayerColors, StatusColors, SyntaxTheme,
+    SystemColors, Theme, ThemeColors, ThemeContent, ThemeFamily, ThemeFamilyContent, ThemeStyles,
 };
 
 #[derive(Debug, Clone)]
@@ -117,32 +116,7 @@ impl ThemeRegistry {
                 AppearanceContent::Light => PlayerColors::light(),
                 AppearanceContent::Dark => PlayerColors::dark(),
             };
-            if !user_theme.style.players.is_empty() {
-                player_colors = PlayerColors(
-                    user_theme
-                        .style
-                        .players
-                        .into_iter()
-                        .map(|player| PlayerColor {
-                            cursor: player
-                                .cursor
-                                .as_ref()
-                                .and_then(|color| try_parse_color(&color).ok())
-                                .unwrap_or_default(),
-                            background: player
-                                .background
-                                .as_ref()
-                                .and_then(|color| try_parse_color(&color).ok())
-                                .unwrap_or_default(),
-                            selection: player
-                                .selection
-                                .as_ref()
-                                .and_then(|color| try_parse_color(&color).ok())
-                                .unwrap_or_default(),
-                        })
-                        .collect(),
-                );
-            }
+            player_colors.merge(&user_theme.style.players);
 
             let mut syntax_colors = match user_theme.appearance {
                 AppearanceContent::Light => SyntaxTheme::light(),
@@ -160,7 +134,7 @@ impl ThemeRegistry {
                                 color: highlight
                                     .color
                                     .as_ref()
-                                    .and_then(|color| try_parse_color(&color).ok()),
+                                    .and_then(|color| try_parse_color(color).ok()),
                                 font_style: highlight.font_style.map(Into::into),
                                 font_weight: highlight.font_weight.map(Into::into),
                                 ..Default::default()
@@ -187,6 +161,14 @@ impl ThemeRegistry {
                 },
             }
         }));
+    }
+
+    /// Removes the themes with the given names from the registry.
+    pub fn remove_user_themes(&self, themes_to_remove: &[SharedString]) {
+        self.state
+            .write()
+            .themes
+            .retain(|name, _| !themes_to_remove.contains(name))
     }
 
     pub fn clear(&mut self) {
@@ -266,7 +248,7 @@ impl ThemeRegistry {
     }
 
     pub async fn read_user_theme(theme_path: &Path, fs: Arc<dyn Fs>) -> Result<ThemeFamilyContent> {
-        let reader = fs.open_sync(&theme_path).await?;
+        let reader = fs.open_sync(theme_path).await?;
         let theme = serde_json_lenient::from_reader(reader)?;
 
         Ok(theme)

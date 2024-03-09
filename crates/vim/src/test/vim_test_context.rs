@@ -1,11 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
-use editor::test::{
-    editor_lsp_test_context::EditorLspTestContext, editor_test_context::EditorTestContext,
-};
-use futures::Future;
+use editor::test::editor_lsp_test_context::EditorLspTestContext;
 use gpui::{Context, View, VisualContext};
-use lsp::request;
 use search::{project_search::ProjectSearchBar, BufferSearchBar};
 
 use crate::{state::Operator, *};
@@ -35,10 +31,25 @@ impl VimTestContext {
         Self::new_with_lsp(lsp, enabled)
     }
 
+    pub async fn new_html(cx: &mut gpui::TestAppContext) -> VimTestContext {
+        Self::init(cx);
+        Self::new_with_lsp(EditorLspTestContext::new_html(cx).await, true)
+    }
+
     pub async fn new_typescript(cx: &mut gpui::TestAppContext) -> VimTestContext {
         Self::init(cx);
         Self::new_with_lsp(
-            EditorLspTestContext::new_typescript(Default::default(), cx).await,
+            EditorLspTestContext::new_typescript(
+                lsp::ServerCapabilities {
+                    rename_provider: Some(lsp::OneOf::Right(lsp::RenameOptions {
+                        prepare_provider: Some(true),
+                        work_done_progress_options: Default::default(),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+            )
+            .await,
             true,
         )
     }
@@ -48,13 +59,14 @@ impl VimTestContext {
             cx.update_global(|store: &mut SettingsStore, cx| {
                 store.update_user_settings::<VimModeSetting>(cx, |s| *s = Some(enabled));
             });
-            settings::KeymapFile::load_asset("keymaps/default.json", cx).unwrap();
-            settings::KeymapFile::load_asset("keymaps/vim.json", cx).unwrap();
+            settings::KeymapFile::load_asset("keymaps/default-macos.json", cx).unwrap();
+            if enabled {
+                settings::KeymapFile::load_asset("keymaps/vim.json", cx).unwrap();
+            }
         });
 
         // Setup search toolbars and keypress hook
         cx.update_workspace(|workspace, cx| {
-            observe_keystrokes(cx);
             workspace.active_pane().update(cx, |pane, cx| {
                 pane.toolbar().update(cx, |toolbar, cx| {
                     let buffer_search_bar = cx.new_view(BufferSearchBar::new);
@@ -78,7 +90,7 @@ impl VimTestContext {
         T: 'static,
         F: FnOnce(&mut T, &mut ViewContext<T>) -> R + 'static,
     {
-        let window = self.window.clone();
+        let window = self.window;
         self.update_window(window, move |_, cx| view.update(cx, update))
             .unwrap()
     }
@@ -148,22 +160,22 @@ impl VimTestContext {
         assert_eq!(self.active_operator(), None, "{}", self.assertion_context());
     }
 
-    pub fn handle_request<T, F, Fut>(
-        &self,
-        handler: F,
-    ) -> futures::channel::mpsc::UnboundedReceiver<()>
-    where
-        T: 'static + request::Request,
-        T::Params: 'static + Send,
-        F: 'static + Send + FnMut(lsp::Url, T::Params, gpui::AsyncAppContext) -> Fut,
-        Fut: 'static + Send + Future<Output = Result<T::Result>>,
-    {
-        self.cx.handle_request::<T, F, Fut>(handler)
+    pub fn assert_binding_normal<const COUNT: usize>(
+        &mut self,
+        keystrokes: [&str; COUNT],
+        initial_state: &str,
+        state_after: &str,
+    ) {
+        self.set_state(initial_state, Mode::Normal);
+        self.cx.simulate_keystrokes(keystrokes);
+        self.cx.assert_editor_state(state_after);
+        assert_eq!(self.mode(), Mode::Normal, "{}", self.assertion_context());
+        assert_eq!(self.active_operator(), None, "{}", self.assertion_context());
     }
 }
 
 impl Deref for VimTestContext {
-    type Target = EditorTestContext;
+    type Target = EditorLspTestContext;
 
     fn deref(&self) -> &Self::Target {
         &self.cx

@@ -8,6 +8,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
 use serde::Serialize;
 use std::any::{Any, TypeId};
+use std::time::Instant;
 use std::{
     cmp,
     fmt::Debug,
@@ -192,26 +193,25 @@ messages!(
     (GetReferencesResponse, Background),
     (GetTypeDefinition, Background),
     (GetTypeDefinitionResponse, Background),
+    (GetImplementation, Background),
+    (GetImplementationResponse, Background),
     (GetUsers, Foreground),
     (Hello, Foreground),
     (IncomingCall, Foreground),
     (InlayHints, Background),
     (InlayHintsResponse, Background),
     (InviteChannelMember, Foreground),
-    (JoinChannel2, Foreground),
     (JoinChannel, Foreground),
     (JoinChannelBuffer, Foreground),
     (JoinChannelBufferResponse, Foreground),
     (JoinChannelChat, Foreground),
     (JoinChannelChatResponse, Foreground),
     (JoinProject, Foreground),
+    (JoinHostedProject, Foreground),
     (JoinProjectResponse, Foreground),
     (JoinRoom, Foreground),
     (JoinRoomResponse, Foreground),
     (LeaveChannelBuffer, Background),
-    (JoinChannelCall, Foreground),
-    (JoinChannelCallResponse, Foreground),
-    (LeaveChannelCall, Foreground),
     (LeaveChannelChat, Foreground),
     (LeaveProject, Foreground),
     (LeaveRoom, Foreground),
@@ -316,6 +316,7 @@ request_messages!(
     (GetCodeActions, GetCodeActionsResponse),
     (GetCompletions, GetCompletionsResponse),
     (GetDefinition, GetDefinitionResponse),
+    (GetImplementation, GetImplementationResponse),
     (GetDocumentHighlights, GetDocumentHighlightsResponse),
     (GetHover, GetHoverResponse),
     (GetNotifications, GetNotificationsResponse),
@@ -328,11 +329,9 @@ request_messages!(
     (InlayHints, InlayHintsResponse),
     (InviteChannelMember, Ack),
     (JoinChannel, JoinRoomResponse),
-    (JoinChannel2, JoinRoomResponse),
-    (JoinChannelCall, JoinChannelCallResponse),
-    (LeaveChannelCall, Ack),
     (JoinChannelBuffer, JoinChannelBufferResponse),
     (JoinChannelChat, JoinChannelChatResponse),
+    (JoinHostedProject, JoinProjectResponse),
     (JoinProject, JoinProjectResponse),
     (JoinRoom, JoinRoomResponse),
     (LeaveChannelBuffer, Ack),
@@ -395,6 +394,7 @@ entity_messages!(
     GetCodeActions,
     GetCompletions,
     GetDefinition,
+    GetImplementation,
     GetDocumentHighlights,
     GetHover,
     GetProjectSymbols,
@@ -516,8 +516,9 @@ impl<S> MessageStream<S>
 where
     S: futures::Stream<Item = Result<WebSocketMessage, anyhow::Error>> + Unpin,
 {
-    pub async fn read(&mut self) -> Result<Message, anyhow::Error> {
+    pub async fn read(&mut self) -> Result<(Message, Instant), anyhow::Error> {
         while let Some(bytes) = self.stream.next().await {
+            let received_at = Instant::now();
             match bytes? {
                 WebSocketMessage::Binary(bytes) => {
                     zstd::stream::copy_decode(bytes.as_slice(), &mut self.encoding_buffer).unwrap();
@@ -526,10 +527,10 @@ where
 
                     self.encoding_buffer.clear();
                     self.encoding_buffer.shrink_to(MAX_BUFFER_LEN);
-                    return Ok(Message::Envelope(envelope));
+                    return Ok((Message::Envelope(envelope), received_at));
                 }
-                WebSocketMessage::Ping(_) => return Ok(Message::Ping),
-                WebSocketMessage::Pong(_) => return Ok(Message::Pong),
+                WebSocketMessage::Ping(_) => return Ok((Message::Ping, received_at)),
+                WebSocketMessage::Pong(_) => return Ok((Message::Pong, received_at)),
                 WebSocketMessage::Close(_) => break,
                 _ => {}
             }

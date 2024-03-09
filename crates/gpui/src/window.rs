@@ -35,7 +35,10 @@ use std::{
 use util::{measure, ResultExt};
 
 mod element_cx;
+mod prompts;
+
 pub use element_cx::*;
+pub use prompts::*;
 
 const ACTIVE_DRAG_Z_INDEX: u16 = 1;
 
@@ -272,6 +275,7 @@ pub struct Window {
     appearance_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
     pub(crate) dirty: Rc<Cell<bool>>,
+    pub(crate) needs_present: Rc<Cell<bool>>,
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
     pub(crate) refreshing: bool,
     pub(crate) drawing: bool,
@@ -279,7 +283,7 @@ pub struct Window {
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
     pending_input: Option<PendingInput>,
-    graphics_profiler_enabled: bool,
+    prompt: Option<RenderablePromptHandle>,
 }
 
 #[derive(Default, Debug)]
@@ -338,13 +342,21 @@ impl Window {
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let dirty = Rc::new(Cell::new(true));
         let active = Rc::new(Cell::new(false));
+        let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
 
+        platform_window.on_close(Box::new({
+            let mut cx = cx.to_async();
+            move || {
+                let _ = handle.update(&mut cx, |_, cx| cx.remove_window());
+            }
+        }));
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let dirty = dirty.clone();
             let active = active.clone();
+            let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
             move || {
@@ -359,6 +371,12 @@ impl Window {
                         .log_err();
                 }
 
+                // Keep presenting the current scene for 1 extra second since the
+                // last input to prevent the display from underclocking the refresh rate.
+                let needs_present = needs_present.get()
+                    || (active.get()
+                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+
                 if dirty.get() {
                     measure("frame duration", || {
                         handle
@@ -368,12 +386,7 @@ impl Window {
                             })
                             .log_err();
                     })
-                }
-                // Keep presenting the current scene for 1 extra second since the
-                // last input to prevent the display from underclocking the refresh rate.
-                else if active.get()
-                    && last_input_timestamp.get().elapsed() < Duration::from_secs(1)
-                {
+                } else if needs_present {
                     handle.update(&mut cx, |_, cx| cx.present()).log_err();
                 }
             }
@@ -456,6 +469,7 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             active,
             dirty,
+            needs_present,
             last_input_timestamp,
             refreshing: false,
             drawing: false,
@@ -463,7 +477,7 @@ impl Window {
             focus: None,
             focus_enabled: true,
             pending_input: None,
-            graphics_profiler_enabled: false,
+            prompt: None,
         }
     }
     fn new_focus_listener(
@@ -939,7 +953,8 @@ impl<'a> WindowContext<'a> {
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [Scene], use [present].
-    pub(crate) fn draw(&mut self) {
+    #[profiling::function]
+    pub fn draw(&mut self) {
         self.window.dirty.set(false);
         self.window.drawing = true;
 
@@ -950,6 +965,7 @@ impl<'a> WindowContext<'a> {
         }
 
         let root_view = self.window.root_view.take().unwrap();
+        let mut prompt = self.window.prompt.take();
         self.with_element_context(|cx| {
             cx.with_z_index(0, |cx| {
                 cx.with_key_dispatch(Some(KeyContext::default()), None, |_, cx| {
@@ -968,10 +984,24 @@ impl<'a> WindowContext<'a> {
                     }
 
                     let available_space = cx.window.viewport_size.map(Into::into);
-                    root_view.draw(Point::default(), available_space, cx);
+
+                    let origin = Point::default();
+                    cx.paint_view(root_view.entity_id(), |cx| {
+                        cx.with_absolute_element_offset(origin, |cx| {
+                            let (layout_id, mut rendered_element) =
+                                (root_view.request_layout)(&root_view, cx);
+                            cx.compute_layout(layout_id, available_space);
+                            rendered_element.paint(cx);
+
+                            if let Some(prompt) = &mut prompt {
+                                prompt.paint(cx).draw(origin, available_space, cx)
+                            }
+                        });
+                    });
                 })
             })
         });
+        self.window.prompt = prompt;
 
         if let Some(active_drag) = self.app.active_drag.take() {
             self.with_element_context(|cx| {
@@ -1011,13 +1041,10 @@ impl<'a> WindowContext<'a> {
         self.window.root_view = Some(root_view);
 
         // Set the cursor only if we're the active window.
-        let cursor_style = self
-            .window
-            .next_frame
-            .requested_cursor_style
-            .take()
-            .unwrap_or(CursorStyle::Arrow);
+        let cursor_style_request = self.window.next_frame.requested_cursor_style.take();
         if self.is_window_active() {
+            let cursor_style =
+                cursor_style_request.map_or(CursorStyle::Arrow, |request| request.style);
             self.platform.set_cursor_style(cursor_style);
         }
 
@@ -1078,15 +1105,58 @@ impl<'a> WindowContext<'a> {
         }
         self.window.refreshing = false;
         self.window.drawing = false;
+        self.window.needs_present.set(true);
     }
 
+    #[profiling::function]
     fn present(&self) {
         self.window
             .platform_window
             .draw(&self.window.rendered_frame.scene);
+        self.window.needs_present.set(false);
+        profiling::finish_frame!();
+    }
+
+    /// Dispatch a given keystroke as though the user had typed it.
+    /// You can create a keystroke with Keystroke::parse("").
+    pub fn dispatch_keystroke(&mut self, keystroke: Keystroke) -> bool {
+        let keystroke = keystroke.with_simulated_ime();
+        if self.dispatch_event(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+        })) {
+            return true;
+        }
+
+        if let Some(input) = keystroke.ime_key {
+            if let Some(mut input_handler) = self.window.platform_window.take_input_handler() {
+                input_handler.dispatch_input(&input, self);
+                self.window.platform_window.set_input_handler(input_handler);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Represent this action as a key binding string, to display in the UI.
+    pub fn keystroke_text_for(&self, action: &dyn Action) -> String {
+        self.bindings_for_action(action)
+            .into_iter()
+            .next()
+            .map(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|| action.name().to_string())
     }
 
     /// Dispatch a mouse or keyboard event on the window.
+    #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput) -> bool {
         self.window.last_input_timestamp.set(Instant::now());
         // Handlers may set this to false by calling `stop_propagation`.
@@ -1234,6 +1304,10 @@ impl<'a> WindowContext<'a> {
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any) {
+        if self.window.dirty.get() {
+            self.draw();
+        }
+
         let node_id = self
             .window
             .focus
@@ -1406,7 +1480,7 @@ impl<'a> WindowContext<'a> {
 
         if !input.is_empty() {
             if let Some(mut input_handler) = self.window.platform_window.take_input_handler() {
-                input_handler.flush_pending_input(&input, self);
+                input_handler.dispatch_input(&input, self);
                 self.window.platform_window.set_input_handler(input_handler)
             }
         }
@@ -1463,14 +1537,6 @@ impl<'a> WindowContext<'a> {
         }
     }
 
-    /// Toggle the graphics profiler to debug your application's rendering performance.
-    pub fn toggle_graphics_profiler(&mut self) {
-        self.window.graphics_profiler_enabled = !self.window.graphics_profiler_enabled;
-        self.window
-            .platform_window
-            .set_graphics_profiler_enabled(self.window.graphics_profiler_enabled);
-    }
-
     /// Register the given handler to be invoked whenever the global of the given type
     /// is updated.
     pub fn observe_global<G: Global>(
@@ -1505,15 +1571,48 @@ impl<'a> WindowContext<'a> {
     /// The provided message will be presented, along with buttons for each answer.
     /// When a button is clicked, the returned Receiver will receive the index of the clicked button.
     pub fn prompt(
-        &self,
+        &mut self,
         level: PromptLevel,
         message: &str,
         detail: Option<&str>,
         answers: &[&str],
     ) -> oneshot::Receiver<usize> {
-        self.window
-            .platform_window
-            .prompt(level, message, detail, answers)
+        let prompt_builder = self.app.prompt_builder.take();
+        let Some(prompt_builder) = prompt_builder else {
+            unreachable!("Re-entrant window prompting is not supported by GPUI");
+        };
+
+        let receiver = match &prompt_builder {
+            PromptBuilder::Default => self
+                .window
+                .platform_window
+                .prompt(level, message, detail, answers)
+                .unwrap_or_else(|| {
+                    self.build_custom_prompt(&prompt_builder, level, message, detail, answers)
+                }),
+            PromptBuilder::Custom(_) => {
+                self.build_custom_prompt(&prompt_builder, level, message, detail, answers)
+            }
+        };
+
+        self.app.prompt_builder = Some(prompt_builder);
+
+        receiver
+    }
+
+    fn build_custom_prompt(
+        &mut self,
+        prompt_builder: &PromptBuilder,
+        level: PromptLevel,
+        message: &str,
+        detail: Option<&str>,
+        answers: &[&str],
+    ) -> oneshot::Receiver<usize> {
+        let (sender, receiver) = oneshot::channel();
+        let handle = PromptHandle::new(sender);
+        let handle = (prompt_builder)(level, message, detail, answers, handle, self);
+        self.window.prompt = Some(handle);
+        receiver
     }
 
     /// Returns all available actions for the focused element.
@@ -1595,17 +1694,7 @@ impl<'a> WindowContext<'a> {
         let mut this = self.to_async();
         self.window
             .platform_window
-            .on_should_close(Box::new(move || {
-                this.update(|cx| {
-                    // Ensure that the window is removed from the app if it's been closed
-                    // by always pre-empting the system close event.
-                    if f(cx) {
-                        cx.remove_window();
-                    }
-                    false
-                })
-                .unwrap_or(true)
-            }))
+            .on_should_close(Box::new(move || this.update(|cx| f(cx)).unwrap_or(true)))
     }
 
     pub(crate) fn parent_view_id(&self) -> EntityId {
@@ -2521,11 +2610,11 @@ impl<V: 'static + Render> WindowHandle<V> {
 
     /// Check if this window is 'active'.
     ///
-    /// Will return `None` if the window is closed.
-    pub fn is_active(&self, cx: &AppContext) -> Option<bool> {
-        cx.windows
-            .get(self.id)
-            .and_then(|window| window.as_ref().map(|window| window.active.get()))
+    /// Will return `None` if the window is closed or currently
+    /// borrowed.
+    pub fn is_active(&self, cx: &mut AppContext) -> Option<bool> {
+        cx.update_window(self.any_handle, |_, cx| cx.is_window_active())
+            .ok()
     }
 }
 

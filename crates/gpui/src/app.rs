@@ -1,33 +1,3 @@
-mod async_context;
-mod entity_map;
-mod model_context;
-#[cfg(any(test, feature = "test-support"))]
-mod test_context;
-
-pub use async_context::*;
-use derive_more::{Deref, DerefMut};
-pub use entity_map::*;
-pub use model_context::*;
-use refineable::Refineable;
-use smol::future::FutureExt;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_context::*;
-use time::UtcOffset;
-
-use crate::WindowAppearance;
-use crate::{
-    current_platform, image_cache::ImageCache, init_app_menus, Action, ActionRegistry, Any,
-    AnyView, AnyWindowHandle, AppMetadata, AssetSource, BackgroundExecutor, ClipboardItem, Context,
-    DispatchPhase, Entity, EventEmitter, ForegroundExecutor, Global, KeyBinding, Keymap, Keystroke,
-    LayoutId, Menu, PathPromptOptions, Pixels, Platform, PlatformDisplay, Point, Render,
-    SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextStyle, TextStyleRefinement,
-    TextSystem, View, ViewContext, Window, WindowContext, WindowHandle, WindowId,
-};
-use anyhow::{anyhow, Result};
-use collections::{FxHashMap, FxHashSet, VecDeque};
-use futures::{channel::oneshot, future::LocalBoxFuture, Future};
-
-use slotmap::SlotMap;
 use std::{
     any::{type_name, TypeId},
     cell::{Ref, RefCell, RefMut},
@@ -38,10 +8,41 @@ use std::{
     sync::{atomic::Ordering::SeqCst, Arc},
     time::Duration,
 };
+
+use anyhow::{anyhow, Result};
+use derive_more::{Deref, DerefMut};
+use futures::{channel::oneshot, future::LocalBoxFuture, Future};
+use slotmap::SlotMap;
+use smol::future::FutureExt;
+use time::UtcOffset;
+
+pub use async_context::*;
+use collections::{FxHashMap, FxHashSet, VecDeque};
+pub use entity_map::*;
+pub use model_context::*;
+use refineable::Refineable;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_context::*;
 use util::{
     http::{self, HttpClient},
     ResultExt,
 };
+
+use crate::{
+    current_platform, image_cache::ImageCache, init_app_menus, Action, ActionRegistry, Any,
+    AnyView, AnyWindowHandle, AppMetadata, AssetSource, BackgroundExecutor, ClipboardItem, Context,
+    DispatchPhase, Entity, EventEmitter, ForegroundExecutor, Global, KeyBinding, Keymap, Keystroke,
+    LayoutId, Menu, PathPromptOptions, Pixels, Platform, PlatformDisplay, Point, PromptBuilder,
+    PromptHandle, PromptLevel, Render, RenderablePromptHandle, SharedString, SubscriberSet,
+    Subscription, SvgRenderer, Task, TextStyle, TextStyleRefinement, TextSystem, View, ViewContext,
+    Window, WindowAppearance, WindowContext, WindowHandle, WindowId,
+};
+
+mod async_context;
+mod entity_map;
+mod model_context;
+#[cfg(any(test, feature = "test-support"))]
+mod test_context;
 
 /// The duration for which futures returned from [AppContext::on_app_context] or [ModelContext::on_app_quit] can run before the application fully quits.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -111,6 +112,9 @@ impl App {
     /// Builds an app with the given asset source.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        log::info!("GPUI was compiled in test mode");
+
         Self(AppContext::new(
             current_platform(),
             Arc::new(()),
@@ -146,14 +150,9 @@ impl App {
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
     where
-        F: 'static + FnMut(Vec<String>, &mut AppContext),
+        F: 'static + FnMut(Vec<String>),
     {
-        let this = Rc::downgrade(&self.0);
-        self.0.borrow().platform.on_open_urls(Box::new(move |urls| {
-            if let Some(app) = this.upgrade() {
-                callback(urls, &mut app.borrow_mut());
-            }
-        }));
+        self.0.borrow().platform.on_open_urls(Box::new(callback));
         self
     }
 
@@ -222,6 +221,7 @@ pub struct AppContext {
     pub(crate) entities: EntityMap,
     pub(crate) new_view_observers: SubscriberSet<TypeId, NewViewListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Window>>,
+    pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
     pub(crate) global_action_listeners:
         FxHashMap<TypeId, Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
@@ -237,6 +237,7 @@ pub struct AppContext {
     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
+    pub(crate) prompt_builder: Option<PromptBuilder>,
 }
 
 impl AppContext {
@@ -281,6 +282,7 @@ impl AppContext {
                 globals_by_type: FxHashMap::default(),
                 entities,
                 new_view_observers: SubscriberSet::new(),
+                window_handles: FxHashMap::default(),
                 windows: SlotMap::with_key(),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 global_action_listeners: FxHashMap::default(),
@@ -295,6 +297,7 @@ impl AppContext {
                 quit_observers: SubscriberSet::new(),
                 layout_id_buffer: Default::default(),
                 propagate_event: true,
+                prompt_builder: Some(PromptBuilder::Default),
             }),
         });
 
@@ -320,6 +323,7 @@ impl AppContext {
         }
 
         self.windows.clear();
+        self.window_handles.clear();
         self.flush_effects();
 
         let futures = futures::future::join_all(futures);
@@ -464,8 +468,8 @@ impl AppContext {
     /// To find all windows of a given type, you could filter on
     pub fn windows(&self) -> Vec<AnyWindowHandle> {
         self.windows
-            .values()
-            .filter_map(|window| Some(window.as_ref()?.handle))
+            .keys()
+            .flat_map(|window_id| self.window_handles.get(&window_id).copied())
             .collect()
     }
 
@@ -488,6 +492,7 @@ impl AppContext {
             let mut window = Window::new(handle.into(), options, cx);
             let root_view = build_root_view(&mut WindowContext::new(cx, &mut window));
             window.root_view.replace(root_view.into());
+            cx.window_handles.insert(id, window.handle);
             cx.windows.get_mut(id).unwrap().replace(window);
             handle
         })
@@ -556,6 +561,14 @@ impl AppContext {
     /// Directs the platform's default browser to open the given URL.
     pub fn open_url(&self, url: &str) {
         self.platform.open_url(url);
+    }
+
+    /// register_url_scheme requests that the given scheme (e.g. `zed` for `zed://` urls)
+    /// is opened by the current app.
+    /// On some platforms (e.g. macOS) you may be able to register URL schemes as part of app
+    /// distribution, but this method exists to let you register schemes at runtime.
+    pub fn register_url_scheme(&self, scheme: &str) -> Task<Result<()>> {
+        self.platform.register_url_scheme(scheme)
     }
 
     /// Returns the full pathname of the current app bundle.
@@ -676,7 +689,6 @@ impl AppContext {
                     self.update_window(window, |_, cx| cx.draw()).unwrap();
                 }
 
-                #[allow(clippy::collapsible_else_if)]
                 if self.pending_effects.is_empty() {
                     break;
                 }
@@ -1192,6 +1204,23 @@ impl AppContext {
     pub fn has_active_drag(&self) -> bool {
         self.active_drag.is_some()
     }
+
+    /// Set the prompt renderer for GPUI. This will replace the default or platform specific
+    /// prompts with this custom implementation.
+    pub fn set_prompt_builder(
+        &mut self,
+        renderer: impl Fn(
+                PromptLevel,
+                &str,
+                Option<&str>,
+                &[&str],
+                PromptHandle,
+                &mut WindowContext,
+            ) -> RenderablePromptHandle
+            + 'static,
+    ) {
+        self.prompt_builder = Some(PromptBuilder::Custom(Box::new(renderer)))
+    }
 }
 
 impl Context for AppContext {
@@ -1236,12 +1265,13 @@ impl Context for AppContext {
                 .get_mut(handle.id)
                 .ok_or_else(|| anyhow!("window not found"))?
                 .take()
-                .unwrap();
+                .ok_or_else(|| anyhow!("window not found"))?;
 
             let root_view = window.root_view.clone().unwrap();
             let result = update(root_view, &mut WindowContext::new(cx, &mut window));
 
             if window.removed {
+                cx.window_handles.remove(&handle.id);
                 cx.windows.remove(handle.id);
             } else {
                 cx.windows

@@ -3,7 +3,7 @@
 //! Not literally though - rendering, layout and all that jazz is a responsibility of [`EditorElement`][EditorElement].
 //! Instead, [`DisplayMap`] decides where Inlays/Inlay hints are displayed, when
 //! to apply a soft wrap, where to add fold indicators, whether there are any tabs in the buffer that
-//! we display as spaces and where to display custom blocks (like diagnostics)
+//! we display as spaces and where to display custom blocks (like diagnostics).
 //! Seems like a lot? That's because it is. [`DisplayMap`] is conceptually made up
 //! of several smaller structures that form a hierarchy (starting at the bottom):
 //! - [`InlayMap`] that decides where the [`Inlay`]s should be displayed.
@@ -24,10 +24,7 @@ mod tab_map;
 mod wrap_map;
 
 use crate::EditorStyle;
-use crate::{
-    hover_links::InlayHighlight, movement::TextLayoutDetails, Anchor, AnchorRangeExt, InlayId,
-    MultiBuffer, MultiBufferSnapshot, ToOffset, ToPoint,
-};
+use crate::{hover_links::InlayHighlight, movement::TextLayoutDetails, InlayId};
 pub use block_map::{BlockMap, BlockPoint};
 use collections::{BTreeMap, HashMap, HashSet};
 use fold_map::FoldMap;
@@ -37,6 +34,7 @@ use language::{
     language_settings::language_settings, OffsetUtf16, Point, Subscription as BufferSubscription,
 };
 use lsp::DiagnosticSeverity;
+use multi_buffer::{Anchor, AnchorRangeExt, MultiBuffer, MultiBufferSnapshot, ToOffset, ToPoint};
 use std::{any::TypeId, borrow::Cow, fmt::Debug, num::NonZeroU32, ops::Range, sync::Arc};
 use sum_tree::{Bias, TreeMap};
 use tab_map::TabMap;
@@ -67,15 +65,27 @@ pub trait ToDisplayPoint {
 type TextHighlights = TreeMap<Option<TypeId>, Arc<(HighlightStyle, Vec<Range<Anchor>>)>>;
 type InlayHighlights = BTreeMap<TypeId, HashMap<InlayId, (HighlightStyle, InlayHighlight)>>;
 
+/// Decides how text in a [`MultiBuffer`] should be displayed in a buffer, handling inlay hints,
+/// folding, hard tabs, soft wrapping, custom blocks (like diagnostics), and highlighting.
+///
+/// See the [module level documentation](self) for more information.
 pub struct DisplayMap {
+    /// The buffer that we are displaying.
     buffer: Model<MultiBuffer>,
     buffer_subscription: BufferSubscription,
-    fold_map: FoldMap,
+    /// Decides where the [`Inlay`]s should be displayed.
     inlay_map: InlayMap,
+    /// Decides where the fold indicators should be and tracks parts of a source file that are currently folded.
+    fold_map: FoldMap,
+    /// Keeps track of hard tabs in a buffer.
     tab_map: TabMap,
+    /// Handles soft wrapping.
     wrap_map: Model<WrapMap>,
+    /// Tracks custom blocks such as diagnostics that should be displayed within buffer.
     block_map: BlockMap,
+    /// Regions of text that should be highlighted.
     text_highlights: TextHighlights,
+    /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     pub clip_at_line_ends: bool,
 }
@@ -316,7 +326,7 @@ impl DisplayMap {
             .read(cx)
             .as_singleton()
             .and_then(|buffer| buffer.read(cx).language());
-        language_settings(language.as_deref(), None, cx).tab_size
+        language_settings(language, None, cx).tab_size
     }
 
     #[cfg(test)]
@@ -492,7 +502,7 @@ impl DisplaySnapshot {
 
     /// Returns text chunks starting at the end of the given display row in reverse until the start of the file
     pub fn reverse_text_chunks(&self, display_row: u32) -> impl Iterator<Item = &str> {
-        (0..=display_row).into_iter().rev().flat_map(|row| {
+        (0..=display_row).rev().flat_map(|row| {
             self.block_snapshot
                 .chunks(row..row + 1, false, Highlights::default())
                 .map(|h| h.text)
@@ -502,13 +512,13 @@ impl DisplaySnapshot {
         })
     }
 
-    pub fn chunks<'a>(
-        &'a self,
+    pub fn chunks(
+        &self,
         display_rows: Range<u32>,
         language_aware: bool,
         inlay_highlight_style: Option<HighlightStyle>,
         suggestion_highlight_style: Option<HighlightStyle>,
-    ) -> DisplayChunks<'a> {
+    ) -> DisplayChunks<'_> {
         self.block_snapshot.chunks(
             display_rows,
             language_aware,
@@ -837,7 +847,7 @@ impl DisplaySnapshot {
         self.block_snapshot.longest_row()
     }
 
-    pub fn fold_for_line(self: &Self, buffer_row: u32) -> Option<FoldStatus> {
+    pub fn fold_for_line(&self, buffer_row: u32) -> Option<FoldStatus> {
         if self.is_line_folded(buffer_row) {
             Some(FoldStatus::Folded)
         } else if self.is_foldable(buffer_row) {
@@ -847,7 +857,7 @@ impl DisplaySnapshot {
         }
     }
 
-    pub fn is_foldable(self: &Self, buffer_row: u32) -> bool {
+    pub fn is_foldable(&self, buffer_row: u32) -> bool {
         let max_row = self.buffer_snapshot.max_buffer_row();
         if buffer_row >= max_row {
             return false;
@@ -870,7 +880,7 @@ impl DisplaySnapshot {
         false
     }
 
-    pub fn foldable_range(self: &Self, buffer_row: u32) -> Option<Range<Point>> {
+    pub fn foldable_range(&self, buffer_row: u32) -> Option<Range<Point>> {
         let start = Point::new(buffer_row, self.buffer_snapshot.line_len(buffer_row));
         if self.is_foldable(start.row) && !self.is_line_folded(start.row) {
             let (start_indent, _) = self.line_indent_for_buffer_row(buffer_row);
@@ -1281,7 +1291,7 @@ pub mod tests {
 
         let mut cx = EditorTestContext::new(cx).await;
         let editor = cx.editor.clone();
-        let window = cx.window.clone();
+        let window = cx.window;
 
         _ = cx.update_window(window, |_, cx| {
             let text_layout_details =
@@ -1445,10 +1455,8 @@ pub mod tests {
             }"#
         .unindent();
 
-        let theme = SyntaxTheme::new_test(vec![
-            ("mod.body", Hsla::red().into()),
-            ("fn.name", Hsla::blue().into()),
-        ]);
+        let theme =
+            SyntaxTheme::new_test(vec![("mod.body", Hsla::red()), ("fn.name", Hsla::blue())]);
         let language = Arc::new(
             Language::new(
                 LanguageConfig {
@@ -1535,10 +1543,8 @@ pub mod tests {
             }"#
         .unindent();
 
-        let theme = SyntaxTheme::new_test(vec![
-            ("mod.body", Hsla::red().into()),
-            ("fn.name", Hsla::blue().into()),
-        ]);
+        let theme =
+            SyntaxTheme::new_test(vec![("mod.body", Hsla::red()), ("fn.name", Hsla::blue())]);
         let language = Arc::new(
             Language::new(
                 LanguageConfig {
@@ -1606,10 +1612,8 @@ pub mod tests {
     async fn test_chunks_with_text_highlights(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| init_test(cx, |_| {}));
 
-        let theme = SyntaxTheme::new_test(vec![
-            ("operator", Hsla::red().into()),
-            ("string", Hsla::green().into()),
-        ]);
+        let theme =
+            SyntaxTheme::new_test(vec![("operator", Hsla::red()), ("string", Hsla::green())]);
         let language = Arc::new(
             Language::new(
                 LanguageConfig {
@@ -1822,10 +1826,10 @@ pub mod tests {
         )
     }
 
-    fn syntax_chunks<'a>(
+    fn syntax_chunks(
         rows: Range<u32>,
         map: &Model<DisplayMap>,
-        theme: &'a SyntaxTheme,
+        theme: &SyntaxTheme,
         cx: &mut AppContext,
     ) -> Vec<(String, Option<Hsla>)> {
         chunks(rows, map, theme, cx)
@@ -1834,10 +1838,10 @@ pub mod tests {
             .collect()
     }
 
-    fn chunks<'a>(
+    fn chunks(
         rows: Range<u32>,
         map: &Model<DisplayMap>,
-        theme: &'a SyntaxTheme,
+        theme: &SyntaxTheme,
         cx: &mut AppContext,
     ) -> Vec<(String, Option<Hsla>, Option<Hsla>)> {
         let snapshot = map.update(cx, |map, cx| map.snapshot(cx));

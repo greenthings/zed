@@ -1,11 +1,11 @@
 use crate::{
     db::{self, UserId},
     rpc::RECONNECT_TIMEOUT,
-    tests::{room_participants, test_server::join_channel_call, RoomParticipants, TestServer},
+    tests::{room_participants, RoomParticipants, TestServer},
 };
 use call::ActiveCall;
-use channel::{ChannelId, ChannelMembership, ChannelStore};
-use client::User;
+use channel::{ChannelMembership, ChannelStore};
+use client::{ChannelId, User};
 use futures::future::try_join_all;
 use gpui::{BackgroundExecutor, Model, SharedString, TestAppContext};
 use rpc::{
@@ -281,7 +281,7 @@ async fn test_core_channels(
         .app_state
         .db
         .rename_channel(
-            db::ChannelId::from_proto(channel_a_id),
+            db::ChannelId::from_proto(channel_a_id.0),
             UserId::from_proto(client_a.id()),
             "channel-a-renamed",
         )
@@ -382,7 +382,6 @@ async fn test_channel_room(
         .update(cx_a, |active_call, cx| active_call.join_channel(zed_id, cx))
         .await
         .unwrap();
-    join_channel_call(cx_a).await.unwrap();
 
     // Give everyone a chance to observe user A joining
     executor.run_until_parked();
@@ -430,7 +429,7 @@ async fn test_channel_room(
         .update(cx_b, |active_call, cx| active_call.join_channel(zed_id, cx))
         .await
         .unwrap();
-    join_channel_call(cx_b).await.unwrap();
+
     executor.run_until_parked();
 
     cx_a.read(|cx| {
@@ -552,9 +551,6 @@ async fn test_channel_room(
         .update(cx_b, |active_call, cx| active_call.join_channel(zed_id, cx))
         .await
         .unwrap();
-
-    join_channel_call(cx_a).await.unwrap();
-    join_channel_call(cx_b).await.unwrap();
 
     executor.run_until_parked();
 
@@ -1435,7 +1431,7 @@ fn assert_channels(
                 .ordered_channels()
                 .map(|(depth, channel)| ExpectedChannel {
                     depth,
-                    name: channel.name.clone().into(),
+                    name: channel.name.clone(),
                     id: channel.id,
                 })
                 .collect::<Vec<_>>()
@@ -1448,7 +1444,7 @@ fn assert_channels(
 fn assert_channels_list_shape(
     channel_store: &Model<ChannelStore>,
     cx: &TestAppContext,
-    expected_channels: &[(u64, usize)],
+    expected_channels: &[(ChannelId, usize)],
 ) {
     let actual = cx.read(|cx| {
         channel_store.read_with(cx, |store, _| {

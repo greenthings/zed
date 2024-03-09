@@ -29,8 +29,11 @@ pub struct SelectionsCollection {
     buffer: Model<MultiBuffer>,
     pub next_selection_id: usize,
     pub line_mode: bool,
-    disjoint: Arc<[Selection<Anchor>]>,
-    pending: Option<PendingSelection>,
+    /// The non-pending, non-overlapping selections.
+    /// The [SelectionsCollection::pending] selection could possibly overlap these
+    pub disjoint: Arc<[Selection<Anchor>]>,
+    /// A pending selection, such as when the mouse is being dragged
+    pub pending: Option<PendingSelection>,
 }
 
 impl SelectionsCollection {
@@ -475,7 +478,7 @@ impl<'a> MutableSelectionsCollection<'a> {
 
         if !oldest.start.cmp(&oldest.end, &self.buffer()).is_eq() {
             let head = oldest.head();
-            oldest.start = head.clone();
+            oldest.start = head;
             oldest.end = head;
             self.collection.disjoint = Arc::from([oldest]);
             self.selections_changed = true;
@@ -791,8 +794,8 @@ impl<'a> MutableSelectionsCollection<'a> {
         let adjusted_disjoint: Vec<_> = anchors_with_status
             .chunks(2)
             .map(|selection_anchors| {
-                let (anchor_ix, start, kept_start) = selection_anchors[0].clone();
-                let (_, end, kept_end) = selection_anchors[1].clone();
+                let (anchor_ix, start, kept_start) = selection_anchors[0];
+                let (_, end, kept_end) = selection_anchors[1];
                 let selection = &self.disjoint[anchor_ix / 2];
                 let kept_head = if selection.reversed {
                     kept_start
@@ -823,8 +826,8 @@ impl<'a> MutableSelectionsCollection<'a> {
             let buffer = self.buffer();
             let anchors =
                 buffer.refresh_anchors([&pending.selection.start, &pending.selection.end]);
-            let (_, start, kept_start) = anchors[0].clone();
-            let (_, end, kept_end) = anchors[1].clone();
+            let (_, start, kept_start) = anchors[0];
+            let (_, end, kept_end) = anchors[1];
             let kept_head = if pending.selection.reversed {
                 kept_start
             } else {

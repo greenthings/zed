@@ -1,6 +1,6 @@
 use crate::{
     rpc::{CLEANUP_TIMEOUT, RECONNECT_TIMEOUT},
-    tests::{channel_id, room_participants, RoomParticipants, TestClient, TestServer},
+    tests::{channel_id, room_participants, rust_lang, RoomParticipants, TestClient, TestServer},
 };
 use call::{room, ActiveCall, ParticipantLocation, Room};
 use client::{User, RECEIVE_TIMEOUT};
@@ -22,7 +22,6 @@ use project::{
     search::SearchQuery, DiagnosticSummary, FormatTrigger, HoverBlockKind, Project, ProjectPath,
 };
 use rand::prelude::*;
-use rpc::proto::ChannelRole;
 use serde_json::json;
 use settings::SettingsStore;
 use std::{
@@ -1881,7 +1880,7 @@ fn active_call_events(cx: &mut TestAppContext) -> Rc<RefCell<Vec<room::Event>>> 
 }
 
 #[gpui::test]
-async fn test_mute(
+async fn test_mute_deafen(
     executor: BackgroundExecutor,
     cx_a: &mut TestAppContext,
     cx_b: &mut TestAppContext,
@@ -1920,7 +1919,7 @@ async fn test_mute(
     room_a.read_with(cx_a, |room, _| assert!(!room.is_muted()));
     room_b.read_with(cx_b, |room, _| assert!(!room.is_muted()));
 
-    // Users A and B are both unmuted.
+    // Users A and B are both muted.
     assert_eq!(
         participant_audio_state(&room_a, cx_a),
         &[ParticipantAudioState {
@@ -1962,6 +1961,30 @@ async fn test_mute(
         }]
     );
 
+    // User A deafens
+    room_a.update(cx_a, |room, cx| room.toggle_deafen(cx));
+    executor.run_until_parked();
+
+    // User A does not hear user B.
+    room_a.read_with(cx_a, |room, _| assert!(room.is_muted()));
+    room_b.read_with(cx_b, |room, _| assert!(!room.is_muted()));
+    assert_eq!(
+        participant_audio_state(&room_a, cx_a),
+        &[ParticipantAudioState {
+            user_id: client_b.user_id().unwrap(),
+            is_muted: false,
+            audio_tracks_playing: vec![false],
+        }]
+    );
+    assert_eq!(
+        participant_audio_state(&room_b, cx_b),
+        &[ParticipantAudioState {
+            user_id: client_a.user_id().unwrap(),
+            is_muted: true,
+            audio_tracks_playing: vec![true],
+        }]
+    );
+
     // User B calls user C, C joins.
     active_call_b
         .update(cx_b, |call, cx| {
@@ -1976,6 +1999,22 @@ async fn test_mute(
         .unwrap();
     executor.run_until_parked();
 
+    // User A does not hear users B or C.
+    assert_eq!(
+        participant_audio_state(&room_a, cx_a),
+        &[
+            ParticipantAudioState {
+                user_id: client_b.user_id().unwrap(),
+                is_muted: false,
+                audio_tracks_playing: vec![false],
+            },
+            ParticipantAudioState {
+                user_id: client_c.user_id().unwrap(),
+                is_muted: false,
+                audio_tracks_playing: vec![false],
+            }
+        ]
+    );
     assert_eq!(
         participant_audio_state(&room_b, cx_b),
         &[
@@ -2781,8 +2820,8 @@ async fn test_git_status_sync(
         )
         .await;
 
-    const A_TXT: &'static str = "a.txt";
-    const B_TXT: &'static str = "b.txt";
+    const A_TXT: &str = "a.txt";
+    const B_TXT: &str = "b.txt";
 
     client_a.fs().set_status_for_repo_via_git_operation(
         Path::new("/dir/.git"),
@@ -3702,7 +3741,6 @@ async fn test_leaving_project(
             client_b.user_store().clone(),
             client_b.language_registry().clone(),
             FakeFs::new(cx.background_executor().clone()),
-            ChannelRole::Member,
             cx,
         )
     })
@@ -3745,8 +3783,7 @@ async fn test_collaborating_with_diagnostics(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
+    client_a.language_registry().add(Arc::new(Language::new(
         LanguageConfig {
             name: "Rust".into(),
             matcher: LanguageMatcher {
@@ -3756,9 +3793,10 @@ async fn test_collaborating_with_diagnostics(
             ..Default::default()
         },
         Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    )));
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
 
     // Share a project as client A
     client_a
@@ -3845,7 +3883,6 @@ async fn test_collaborating_with_diagnostics(
                 DiagnosticSummary {
                     error_count: 1,
                     warning_count: 0,
-                    ..Default::default()
                 },
             )]
         )
@@ -3882,7 +3919,6 @@ async fn test_collaborating_with_diagnostics(
             DiagnosticSummary {
                 error_count: 1,
                 warning_count: 0,
-                ..Default::default()
             },
         )]
     );
@@ -4026,26 +4062,15 @@ async fn test_collaborating_with_lsp_progress_updates_and_diagnostics_ordering(
         .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
         .await;
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language
-        .set_fake_lsp_adapter(Arc::new(FakeLspAdapter {
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+        "Rust",
+        FakeLspAdapter {
             disk_based_diagnostics_progress_token: Some("the-disk-based-token".into()),
             disk_based_diagnostics_sources: vec!["the-disk-based-diagnostics-source".into()],
             ..Default::default()
-        }))
-        .await;
-    client_a.language_registry().add(Arc::new(language));
+        },
+    );
 
     let file_names = &["one.rs", "two.rs", "three.rs", "four.rs", "five.rs"];
     client_a
@@ -4258,20 +4283,10 @@ async fn test_formatting_buffer(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", FakeLspAdapter::default());
 
     // Here we insert a fake tree with a directory that exists on disk. This is needed
     // because later we'll invoke a command, which requires passing a working directory
@@ -4366,8 +4381,9 @@ async fn test_prettier_formatting_buffer(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
+    let test_plugin = "test_plugin";
+
+    client_a.language_registry().add(Arc::new(Language::new(
         LanguageConfig {
             name: "Rust".into(),
             matcher: LanguageMatcher {
@@ -4378,16 +4394,14 @@ async fn test_prettier_formatting_buffer(
             ..Default::default()
         },
         Some(tree_sitter_rust::language()),
-    );
-    let test_plugin = "test_plugin";
-    let mut fake_language_servers = language
-        .set_fake_lsp_adapter(Arc::new(FakeLspAdapter {
+    )));
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp_adapter(
+        "Rust",
+        FakeLspAdapter {
             prettier_plugins: vec![test_plugin],
             ..Default::default()
-        }))
-        .await;
-    let language = Arc::new(language);
-    client_a.language_registry().add(Arc::clone(&language));
+        },
+    );
 
     // Here we insert a fake tree with a directory that exists on disk. This is needed
     // because later we'll invoke a command, which requires passing a working directory
@@ -4485,20 +4499,10 @@ async fn test_definition(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
+    client_a.language_registry().add(rust_lang());
 
     client_a
         .fs()
@@ -4632,20 +4636,10 @@ async fn test_references(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
 
     client_a
         .fs()
@@ -4832,20 +4826,10 @@ async fn test_document_highlights(
         )
         .await;
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
+    client_a.language_registry().add(rust_lang());
 
     let (project_a, worktree_id) = client_a.build_local_project("/root-1", cx_a).await;
     let project_id = active_call_a
@@ -4938,20 +4922,10 @@ async fn test_lsp_hover(
         )
         .await;
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
 
     let (project_a, worktree_id) = client_a.build_local_project("/root-1", cx_a).await;
     let project_id = active_call_a
@@ -5037,20 +5011,10 @@ async fn test_project_symbols(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
 
     client_a
         .fs()
@@ -5149,20 +5113,10 @@ async fn test_open_buffer_while_getting_definition_pointing_to_it(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    // Set up a fake language server.
-    let mut language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_language_servers = language.set_fake_lsp_adapter(Default::default()).await;
-    client_a.language_registry().add(Arc::new(language));
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp_adapter("Rust", Default::default());
 
     client_a
         .fs()

@@ -5,7 +5,7 @@ pub mod room;
 use anyhow::{anyhow, Result};
 use audio::Audio;
 use call_settings::CallSettings;
-use client::{proto, Client, TypedEnvelope, User, UserStore, ZED_ALWAYS_ACTIVE};
+use client::{proto, ChannelId, Client, TypedEnvelope, User, UserStore, ZED_ALWAYS_ACTIVE};
 use collections::HashSet;
 use futures::{channel::oneshot, future::Shared, Future, FutureExt};
 use gpui::{
@@ -84,7 +84,6 @@ pub struct ActiveCall {
     ),
     client: Arc<Client>,
     user_store: Model<UserStore>,
-    pending_channel_id: Option<u64>,
     _subscriptions: Vec<client::Subscription>,
 }
 
@@ -98,7 +97,6 @@ impl ActiveCall {
             location: None,
             pending_invites: Default::default(),
             incoming_call: watch::channel(),
-            pending_channel_id: None,
             _join_debouncer: OneAtATime { cancel: None },
             _subscriptions: vec![
                 client.add_request_handler(cx.weak_model(), Self::handle_incoming_call),
@@ -109,12 +107,8 @@ impl ActiveCall {
         }
     }
 
-    pub fn channel_id(&self, cx: &AppContext) -> Option<u64> {
+    pub fn channel_id(&self, cx: &AppContext) -> Option<ChannelId> {
         self.room()?.read(cx).channel_id()
-    }
-
-    pub fn pending_channel_id(&self) -> Option<u64> {
-        self.pending_channel_id
     }
 
     async fn handle_incoming_call(
@@ -308,7 +302,7 @@ impl ActiveCall {
             return Task::ready(Ok(()));
         }
 
-        let room_id = call.room_id.clone();
+        let room_id = call.room_id;
         let client = self.client.clone();
         let user_store = self.user_store.clone();
         let join = self
@@ -342,16 +336,14 @@ impl ActiveCall {
 
     pub fn join_channel(
         &mut self,
-        channel_id: u64,
+        channel_id: ChannelId,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Option<Model<Room>>>> {
-        let mut leave = None;
         if let Some(room) = self.room().cloned() {
             if room.read(cx).channel_id() == Some(channel_id) {
                 return Task::ready(Ok(Some(room)));
             } else {
-                let (room, _) = self.room.take().unwrap();
-                leave = room.update(cx, |room, cx| Some(room.leave(cx)));
+                room.update(cx, |room, cx| room.clear_state(cx));
             }
         }
 
@@ -361,21 +353,14 @@ impl ActiveCall {
 
         let client = self.client.clone();
         let user_store = self.user_store.clone();
-        self.pending_channel_id = Some(channel_id);
         let join = self._join_debouncer.spawn(cx, move |cx| async move {
-            if let Some(task) = leave {
-                task.await?
-            }
             Room::join_channel(channel_id, client, user_store, cx).await
         });
 
         cx.spawn(|this, mut cx| async move {
             let room = join.await?;
-            this.update(&mut cx, |this, cx| {
-                this.pending_channel_id.take();
-                this.set_room(room.clone(), cx)
-            })?
-            .await?;
+            this.update(&mut cx, |this, cx| this.set_room(room.clone(), cx))?
+                .await?;
             this.update(&mut cx, |this, cx| {
                 this.report_call_event("join channel", cx)
             })?;
@@ -502,7 +487,7 @@ impl ActiveCall {
 pub fn report_call_event_for_room(
     operation: &'static str,
     room_id: u64,
-    channel_id: Option<u64>,
+    channel_id: Option<ChannelId>,
     client: &Arc<Client>,
 ) {
     let telemetry = client.telemetry();
@@ -512,7 +497,7 @@ pub fn report_call_event_for_room(
 
 pub fn report_call_event_for_channel(
     operation: &'static str,
-    channel_id: u64,
+    channel_id: ChannelId,
     client: &Arc<Client>,
     cx: &AppContext,
 ) {

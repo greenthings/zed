@@ -18,8 +18,8 @@ struct GitHubUser {
 async fn main() {
     load_dotenv().expect("failed to load .env.toml file");
 
-    let mut admin_logins =
-        load_admins("./.admins.default.json").expect("failed to load default admins file");
+    let mut admin_logins = load_admins("crates/collab/.admins.default.json")
+        .expect("failed to load default admins file");
     if let Ok(other_admins) = load_admins("./.admins.json") {
         admin_logins.extend(other_admins);
     }
@@ -88,9 +88,9 @@ async fn fetch_github<T: DeserializeOwned>(client: &reqwest::Client, url: &str) 
         .header("user-agent", "zed")
         .send()
         .await
-        .expect(&format!("failed to fetch '{}'", url));
+        .unwrap_or_else(|_| panic!("failed to fetch '{}'", url));
     response
         .json()
         .await
-        .expect(&format!("failed to deserialize github user from '{}'", url))
+        .unwrap_or_else(|_| panic!("failed to deserialize github user from '{}'", url))
 }

@@ -1,3 +1,8 @@
+pub mod events;
+pub mod extensions;
+pub mod ips_file;
+pub mod slack;
+
 use crate::{
     auth,
     db::{ContributorSelector, User, UserId},
@@ -6,7 +11,7 @@ use crate::{
 use anyhow::anyhow;
 use axum::{
     body::Body,
-    extract::{Path, Query},
+    extract::{self, Path, Query},
     http::{self, Request, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -18,13 +23,13 @@ use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tracing::instrument;
 
-pub fn routes(rpc_server: Arc<rpc::Server>, state: Arc<AppState>) -> Router<Body> {
+pub use extensions::fetch_extensions_from_blob_store_periodically;
+
+pub fn routes(rpc_server: Option<Arc<rpc::Server>>, state: Arc<AppState>) -> Router<(), Body> {
     Router::new()
         .route("/user", get(get_authenticated_user))
         .route("/users/:id/access_tokens", post(create_access_token))
-        .route("/panic", post(trace_panic))
         .route("/rpc_server_snapshot", get(get_rpc_server_snapshot))
         .route("/contributors", get(get_contributors).post(add_contributor))
         .route("/contributor", get(check_is_contributor))
@@ -115,23 +120,13 @@ struct CreateUserResponse {
     metrics_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct Panic {
-    version: String,
-    release_channel: String,
-    backtrace_hash: String,
-    text: String,
-}
-
-#[instrument(skip(panic))]
-async fn trace_panic(panic: Json<Panic>) -> Result<()> {
-    tracing::error!(version = %panic.version, release_channel = %panic.release_channel, backtrace_hash = %panic.backtrace_hash, text = %panic.text, "panic report");
-    Ok(())
-}
-
 async fn get_rpc_server_snapshot(
-    Extension(rpc_server): Extension<Arc<rpc::Server>>,
+    Extension(rpc_server): Extension<Option<Arc<rpc::Server>>>,
 ) -> Result<ErasedJson> {
+    let Some(rpc_server) = rpc_server else {
+        return Err(Error::Internal(anyhow!("rpc server is not available")));
+    };
+
     Ok(ErasedJson::pretty(rpc_server.snapshot().await))
 }
 
@@ -181,17 +176,16 @@ async fn check_is_contributor(
 }
 
 async fn add_contributor(
-    Json(params): Json<AuthenticatedUserParams>,
     Extension(app): Extension<Arc<AppState>>,
+    extract::Json(params): extract::Json<AuthenticatedUserParams>,
 ) -> Result<()> {
-    Ok(app
-        .db
+    app.db
         .add_contributor(
             &params.github_login,
             params.github_user_id,
             params.github_email.as_deref(),
         )
-        .await?)
+        .await
 }
 
 #[derive(Deserialize)]

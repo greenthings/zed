@@ -35,7 +35,7 @@
 //!
 //! - Low level, imperative UI with Elements. Elements are the building blocks of UI in GPUI, and they
 //!   provide a nice wrapper around an imperative API that provides as much flexibility and control as
-//!   you need. Elements have total control over how they and their child elements are rendered and and
+//!   you need. Elements have total control over how they and their child elements are rendered and
 //!   can be used for making efficient views into large lists, implement custom layouting for a code editor,
 //!   and anything else you can think of. See the [`element`] module for more information.
 //!
@@ -60,7 +60,9 @@
 //! and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
 
 #![deny(missing_docs)]
-#![allow(clippy::type_complexity)]
+#![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
+#![allow(clippy::collapsible_else_if)] // False positives in platform specific code
+#![allow(unused_mut)] // False positives in platform specific code
 
 #[macro_use]
 mod action;

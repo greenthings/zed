@@ -110,12 +110,10 @@ impl Database {
         user_id: UserId,
         connection: ConnectionId,
         live_kit_room: &str,
-        release_channel: &str,
     ) -> Result<proto::Room> {
         self.transaction(|tx| async move {
             let room = room::ActiveModel {
                 live_kit_room: ActiveValue::set(live_kit_room.into()),
-                environment: ActiveValue::set(Some(release_channel.to_string())),
                 ..Default::default()
             }
             .insert(&*tx)
@@ -135,7 +133,6 @@ impl Database {
                 ))),
                 participant_index: ActiveValue::set(Some(0)),
                 role: ActiveValue::set(Some(ChannelRole::Admin)),
-                in_call: ActiveValue::set(true),
 
                 id: ActiveValue::NotSet,
                 location_kind: ActiveValue::NotSet,
@@ -172,7 +169,7 @@ impl Database {
 
             let called_user_role = match caller.role.unwrap_or(ChannelRole::Member) {
                 ChannelRole::Admin | ChannelRole::Member => ChannelRole::Member,
-                ChannelRole::Guest => ChannelRole::Guest,
+                ChannelRole::Guest | ChannelRole::Talker => ChannelRole::Guest,
                 ChannelRole::Banned => return Err(anyhow!("banned users cannot invite").into()),
             };
 
@@ -188,7 +185,6 @@ impl Database {
                 ))),
                 initial_project_id: ActiveValue::set(initial_project_id),
                 role: ActiveValue::set(Some(called_user_role)),
-                in_call: ActiveValue::set(true),
 
                 id: ActiveValue::NotSet,
                 answering_connection_id: ActiveValue::NotSet,
@@ -304,38 +300,28 @@ impl Database {
         room_id: RoomId,
         user_id: UserId,
         connection: ConnectionId,
-        environment: &str,
     ) -> Result<RoomGuard<JoinRoom>> {
         self.room_transaction(room_id, |tx| async move {
             #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
-            enum QueryChannelIdAndEnvironment {
+            enum QueryChannelId {
                 ChannelId,
-                Environment,
             }
 
-            let (channel_id, release_channel): (Option<ChannelId>, Option<String>) =
-                room::Entity::find()
-                    .select_only()
-                    .column(room::Column::ChannelId)
-                    .column(room::Column::Environment)
-                    .filter(room::Column::Id.eq(room_id))
-                    .into_values::<_, QueryChannelIdAndEnvironment>()
-                    .one(&*tx)
-                    .await?
-                    .ok_or_else(|| anyhow!("no such room"))?;
-
-            if let Some(release_channel) = release_channel {
-                if &release_channel != environment {
-                    Err(anyhow!("must join using the {} release", release_channel))?;
-                }
-            }
+            let channel_id: Option<ChannelId> = room::Entity::find()
+                .select_only()
+                .column(room::Column::ChannelId)
+                .filter(room::Column::Id.eq(room_id))
+                .into_values::<_, QueryChannelId>()
+                .one(&*tx)
+                .await?
+                .ok_or_else(|| anyhow!("no such room"))?;
 
             if channel_id.is_some() {
                 Err(anyhow!("tried to join channel call directly"))?
             }
 
             let participant_index = self
-                .get_next_participant_index_internal(room_id, &*tx)
+                .get_next_participant_index_internal(room_id, &tx)
                 .await?;
 
             let result = room_participant::Entity::update_many()
@@ -388,7 +374,7 @@ impl Database {
             .select_only()
             .column(room_participant::Column::ParticipantIndex)
             .into_values::<_, QueryParticipantIndices>()
-            .all(&*tx)
+            .all(tx)
             .await?;
 
         let mut participant_index = 0;
@@ -416,13 +402,12 @@ impl Database {
         &self,
         room_id: RoomId,
         user_id: UserId,
-        autojoin: bool,
         connection: ConnectionId,
         role: ChannelRole,
         tx: &DatabaseTransaction,
     ) -> Result<JoinRoom> {
         let participant_index = self
-            .get_next_participant_index_internal(room_id, &*tx)
+            .get_next_participant_index_internal(room_id, tx)
             .await?;
 
         room_participant::Entity::insert_many([room_participant::ActiveModel {
@@ -440,8 +425,6 @@ impl Database {
             ))),
             participant_index: ActiveValue::Set(Some(participant_index)),
             role: ActiveValue::set(Some(role)),
-            in_call: ActiveValue::set(autojoin),
-
             id: ActiveValue::NotSet,
             location_kind: ActiveValue::NotSet,
             location_project_id: ActiveValue::NotSet,
@@ -458,12 +441,12 @@ impl Database {
                 ])
                 .to_owned(),
         )
-        .exec(&*tx)
+        .exec(tx)
         .await?;
 
         let (channel, room) = self.get_channel_room(room_id, &tx).await?;
         let channel = channel.ok_or_else(|| anyhow!("no channel for room"))?;
-        let channel_members = self.get_channel_participants(&channel, &*tx).await?;
+        let channel_members = self.get_channel_participants(&channel, tx).await?;
         Ok(JoinRoom {
             room,
             channel_id: Some(channel.id),
@@ -485,15 +468,7 @@ impl Database {
                     Condition::all()
                         .add(room_participant::Column::RoomId.eq(room_id))
                         .add(room_participant::Column::UserId.eq(user_id))
-                        .add(room_participant::Column::AnsweringConnectionId.is_not_null())
-                        .add(
-                            Condition::any()
-                                .add(room_participant::Column::AnsweringConnectionLost.eq(true))
-                                .add(
-                                    room_participant::Column::AnsweringConnectionServerId
-                                        .ne(connection.owner_id as i32),
-                                ),
-                        ),
+                        .add(room_participant::Column::AnsweringConnectionId.is_not_null()),
                 )
                 .set(room_participant::ActiveModel {
                     answering_connection_id: ActiveValue::set(Some(connection.id as i32)),
@@ -516,7 +491,7 @@ impl Database {
                     .one(&*tx)
                     .await?
                     .ok_or_else(|| anyhow!("project does not exist"))?;
-                if project.host_user_id != user_id {
+                if project.host_user_id != Some(user_id) {
                     return Err(anyhow!("no such project"))?;
                 }
 
@@ -876,7 +851,7 @@ impl Database {
                     }
 
                     if collaborator.is_host {
-                        left_project.host_user_id = collaborator.user_id;
+                        left_project.host_user_id = Some(collaborator.user_id);
                         left_project.host_connection_id = Some(collaborator_connection_id);
                     }
                 }
@@ -1035,7 +1010,7 @@ impl Database {
                 .ok_or_else(|| anyhow!("only admins can set participant role"))?;
 
             if role.requires_cla() {
-                self.check_user_has_signed_cla(user_id, room_id, &*tx)
+                self.check_user_has_signed_cla(user_id, room_id, &tx)
                     .await?;
             }
 
@@ -1046,7 +1021,7 @@ impl Database {
                         .add(room_participant::Column::UserId.eq(user_id)),
                 )
                 .set(room_participant::ActiveModel {
-                    role: ActiveValue::set(Some(ChannelRole::from(role))),
+                    role: ActiveValue::set(Some(role)),
                     ..Default::default()
                 })
                 .exec(&*tx)
@@ -1055,7 +1030,7 @@ impl Database {
             if result.rows_affected != 1 {
                 Err(anyhow!("could not update room participant role"))?;
             }
-            Ok(self.get_room(room_id, &tx).await?)
+            self.get_room(room_id, &tx).await
         })
         .await
     }
@@ -1067,11 +1042,11 @@ impl Database {
         tx: &DatabaseTransaction,
     ) -> Result<()> {
         let channel = room::Entity::find_by_id(room_id)
-            .one(&*tx)
+            .one(tx)
             .await?
             .ok_or_else(|| anyhow!("could not find room"))?
             .find_related(channel::Entity)
-            .one(&*tx)
+            .one(tx)
             .await?;
 
         if let Some(channel) = channel {
@@ -1082,13 +1057,13 @@ impl Database {
                             .is_in(channel.ancestors())
                             .and(channel::Column::RequiresZedCla.eq(true)),
                     )
-                    .count(&*tx)
+                    .count(tx)
                     .await?
                     > 0;
             if requires_zed_cla {
                 if contributor::Entity::find()
                     .filter(contributor::Column::UserId.eq(user_id))
-                    .one(&*tx)
+                    .one(tx)
                     .await?
                     .is_none()
                 {
@@ -1101,10 +1076,9 @@ impl Database {
 
     pub async fn connection_lost(&self, connection: ConnectionId) -> Result<()> {
         self.transaction(|tx| async move {
-            self.room_connection_lost(connection, &*tx).await?;
-            self.channel_buffer_connection_lost(connection, &*tx)
-                .await?;
-            self.channel_chat_connection_lost(connection, &*tx).await?;
+            self.room_connection_lost(connection, &tx).await?;
+            self.channel_buffer_connection_lost(connection, &tx).await?;
+            self.channel_chat_connection_lost(connection, &tx).await?;
             Ok(())
         })
         .await
@@ -1124,7 +1098,7 @@ impl Database {
                             .eq(connection.owner_id as i32),
                     ),
             )
-            .one(&*tx)
+            .one(tx)
             .await?;
 
         if let Some(participant) = participant {
@@ -1132,7 +1106,7 @@ impl Database {
                 answering_connection_lost: ActiveValue::set(true),
                 ..participant.into_active_model()
             })
-            .exec(&*tx)
+            .exec(tx)
             .await?;
         }
         Ok(())
@@ -1263,7 +1237,6 @@ impl Database {
                         location: Some(proto::ParticipantLocation { variant: location }),
                         participant_index: participant_index as u32,
                         role: db_participant.role.unwrap_or(ChannelRole::Member).into(),
-                        in_call: db_participant.in_call,
                     },
                 );
             } else {
@@ -1322,7 +1295,7 @@ impl Database {
         drop(db_followers);
 
         let channel = if let Some(channel_id) = db_room.channel_id {
-            Some(self.get_channel_internal(channel_id, &*tx).await?)
+            Some(self.get_channel_internal(channel_id, tx).await?)
         } else {
             None
         };

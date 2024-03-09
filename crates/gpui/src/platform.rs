@@ -1,14 +1,25 @@
-// todo!(linux): remove
+// todo(linux): remove
 #![cfg_attr(target_os = "linux", allow(dead_code))]
+// todo(windows): remove
+#![cfg_attr(windows, allow(dead_code))]
 
 mod app_menu;
 mod keystroke;
+
 #[cfg(target_os = "linux")]
 mod linux;
+
 #[cfg(target_os = "macos")]
 mod mac;
+
+#[cfg(any(target_os = "linux", target_os = "windows", feature = "macos-blade"))]
+mod blade;
+
 #[cfg(any(test, feature = "test-support"))]
 mod test;
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 use crate::{
     Action, AnyWindowHandle, AsyncWindowContext, BackgroundExecutor, Bounds, DevicePixels, Font,
@@ -46,6 +57,8 @@ pub(crate) use mac::*;
 pub(crate) use test::*;
 use time::UtcOffset;
 pub use util::SemanticVersion;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::*;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn current_platform() -> Rc<dyn Platform> {
@@ -54,6 +67,11 @@ pub(crate) fn current_platform() -> Rc<dyn Platform> {
 #[cfg(target_os = "linux")]
 pub(crate) fn current_platform() -> Rc<dyn Platform> {
     Rc::new(LinuxPlatform::new())
+}
+// todo(windows)
+#[cfg(target_os = "windows")]
+pub(crate) fn current_platform() -> Rc<dyn Platform> {
+    Rc::new(WindowsPlatform::new())
 }
 
 pub(crate) trait Platform: 'static {
@@ -83,6 +101,8 @@ pub(crate) trait Platform: 'static {
 
     fn open_url(&self, url: &str);
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>);
+    fn register_url_scheme(&self, url: &str) -> Task<Result<()>>;
+
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
@@ -163,7 +183,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         msg: &str,
         detail: Option<&str>,
         answers: &[&str],
-    ) -> oneshot::Receiver<usize>;
+    ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
     fn set_title(&mut self, title: &str);
     fn set_edited(&mut self, edited: bool);
@@ -182,8 +202,8 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn is_topmost_for_position(&self, position: Point<Pixels>) -> bool;
     fn draw(&self, scene: &Scene);
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
-    fn set_graphics_profiler_enabled(&self, enabled: bool);
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
@@ -406,11 +426,8 @@ impl PlatformInputHandler {
             .flatten()
     }
 
-    pub(crate) fn flush_pending_input(&mut self, input: &str, cx: &mut WindowContext) {
-        let Some(range) = self.handler.selected_text_range(cx) else {
-            return;
-        };
-        self.handler.replace_text_in_range(Some(range), input, cx);
+    pub(crate) fn dispatch_input(&mut self, input: &str, cx: &mut WindowContext) {
+        self.handler.replace_text_in_range(None, input, cx);
     }
 }
 

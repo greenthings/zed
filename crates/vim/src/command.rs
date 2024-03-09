@@ -1,4 +1,4 @@
-use command_palette::CommandInterceptResult;
+use command_palette_hooks::CommandInterceptResult;
 use editor::actions::{SortLinesCaseInsensitive, SortLinesCaseSensitive};
 use gpui::{impl_actions, Action, AppContext, ViewContext};
 use serde_derive::Deserialize;
@@ -31,7 +31,7 @@ pub fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
     });
 }
 
-pub fn command_interceptor(mut query: &str, _: &AppContext) -> Option<CommandInterceptResult> {
+pub fn command_interceptor(mut query: &str, cx: &AppContext) -> Option<CommandInterceptResult> {
     // Note: this is a very poor simulation of vim's command palette.
     // In the future we should adjust it to handle parsing range syntax,
     // and then calling the appropriate commands with/without ranges.
@@ -41,7 +41,7 @@ pub fn command_interceptor(mut query: &str, _: &AppContext) -> Option<CommandInt
     //
     // For now, you can only do a replace on the % range, and you can
     // only use a specific line number range to "go to line"
-    while query.starts_with(":") {
+    while query.starts_with(':') {
         query = &query[1..];
     }
 
@@ -201,9 +201,40 @@ pub fn command_interceptor(mut query: &str, _: &AppContext) -> Option<CommandInt
             }
             .boxed_clone(),
         ),
+        "tabo" | "tabon" | "tabonl" | "tabonly" => (
+            "tabonly",
+            workspace::CloseInactiveItems {
+                save_intent: Some(SaveIntent::Close),
+            }
+            .boxed_clone(),
+        ),
+        "tabo!" | "tabon!" | "tabonl!" | "tabonly!" => (
+            "tabonly!",
+            workspace::CloseInactiveItems {
+                save_intent: Some(SaveIntent::Skip),
+            }
+            .boxed_clone(),
+        ),
+        "on" | "onl" | "only" => (
+            "only",
+            workspace::CloseInactiveTabsAndPanes {
+                save_intent: Some(SaveIntent::Close),
+            }
+            .boxed_clone(),
+        ),
+        "on!" | "onl!" | "only!" => (
+            "only!",
+            workspace::CloseInactiveTabsAndPanes {
+                save_intent: Some(SaveIntent::Skip),
+            }
+            .boxed_clone(),
+        ),
 
         // quickfix / loclist (merged together for now)
-        "cl" | "cli" | "clis" | "clist" => ("clist", diagnostics::Deploy.boxed_clone()),
+        "cl" | "cli" | "clis" | "clist" => (
+            "clist",
+            cx.build_action("diagnostics::Deploy", None).unwrap(),
+        ),
         "cc" => ("cc", editor::actions::Hover.boxed_clone()),
         "ll" => ("ll", editor::actions::Hover.boxed_clone()),
         "cn" | "cne" | "cnex" | "cnext" => ("cnext", editor::actions::GoToDiagnostic.boxed_clone()),
@@ -233,22 +264,73 @@ pub fn command_interceptor(mut query: &str, _: &AppContext) -> Option<CommandInt
         "sor" | "sor " | "sort" | "sort " => ("sort", SortLinesCaseSensitive.boxed_clone()),
         "sor i" | "sort i" => ("sort i", SortLinesCaseInsensitive.boxed_clone()),
 
+        // Explore, etc.
+        "E" | "Ex" | "Exp" | "Expl" | "Explo" | "Explor" | "Explore" => (
+            "Explore",
+            cx.build_action("project_panel::ToggleFocus", None).unwrap(),
+        ),
+        "H" | "He" | "Hex" | "Hexp" | "Hexpl" | "Hexplo" | "Hexplor" | "Hexplore" => (
+            "Hexplore",
+            cx.build_action("project_panel::ToggleFocus", None).unwrap(),
+        ),
+        "L" | "Le" | "Lex" | "Lexp" | "Lexpl" | "Lexplo" | "Lexplor" | "Lexplore" => (
+            "Lexplore",
+            cx.build_action("project_panel::ToggleFocus", None).unwrap(),
+        ),
+        "S" | "Se" | "Sex" | "Sexp" | "Sexpl" | "Sexplo" | "Sexplor" | "Sexplore" => (
+            "Sexplore",
+            cx.build_action("project_panel::ToggleFocus", None).unwrap(),
+        ),
+        "Ve" | "Vex" | "Vexp" | "Vexpl" | "Vexplo" | "Vexplor" | "Vexplore" => (
+            "Vexplore",
+            cx.build_action("project_panel::ToggleFocus", None).unwrap(),
+        ),
+        "te" | "ter" | "term" => (
+            "term",
+            cx.build_action("terminal_panel::ToggleFocus", None)
+                .unwrap(),
+        ),
+        // Zed panes
+        "T" | "Te" | "Ter" | "Term" => (
+            "Term",
+            cx.build_action("terminal_panel::ToggleFocus", None)
+                .unwrap(),
+        ),
+        "C" | "Co" | "Col" | "Coll" | "Colla" | "Collab" => (
+            "Collab",
+            cx.build_action("collab_panel::ToggleFocus", None).unwrap(),
+        ),
+        "Ch" | "Cha" | "Chat" => (
+            "Chat",
+            cx.build_action("chat_panel::ToggleFocus", None).unwrap(),
+        ),
+        "No" | "Not" | "Noti" | "Notif" | "Notifi" | "Notific" | "Notifica" | "Notificat"
+        | "Notificati" | "Notificatio" | "Notification" => (
+            "Notifications",
+            cx.build_action("notification_panel::ToggleFocus", None)
+                .unwrap(),
+        ),
+        "A" | "AI" | "Ai" => (
+            "AI",
+            cx.build_action("assistant::ToggleFocus", None).unwrap(),
+        ),
+
         // goto (other ranges handled under _ => )
         "$" => ("$", EndOfDocument.boxed_clone()),
         "%" => ("%", EndOfDocument.boxed_clone()),
         "0" => ("0", StartOfDocument.boxed_clone()),
 
         _ => {
-            if query.starts_with("/") || query.starts_with("?") {
+            if query.starts_with('/') || query.starts_with('?') {
                 (
                     query,
                     FindCommand {
                         query: query[1..].to_string(),
-                        backwards: query.starts_with("?"),
+                        backwards: query.starts_with('?'),
                     }
                     .boxed_clone(),
                 )
-            } else if query.starts_with("%") {
+            } else if query.starts_with('%') {
                 (
                     query,
                     ReplaceCommand {
@@ -276,7 +358,7 @@ pub fn command_interceptor(mut query: &str, _: &AppContext) -> Option<CommandInt
 
 fn generate_positions(string: &str, query: &str) -> Vec<usize> {
     let mut positions = Vec::new();
-    let mut chars = query.chars().into_iter();
+    let mut chars = query.chars();
 
     let Some(mut current) = chars.next() else {
         return positions;
@@ -408,9 +490,7 @@ mod test {
 
         assert_eq!(fs.load(&path).await.unwrap(), "@\n");
 
-        fs.as_fake()
-            .write_file_internal(path, "oops\n".to_string())
-            .unwrap();
+        fs.as_fake().insert_file(path, b"oops\n".to_vec()).await;
 
         // conflict!
         cx.simulate_keystrokes(["i", "@", "escape"]);

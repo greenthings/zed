@@ -2,6 +2,7 @@ mod base_keymap_picker;
 mod base_keymap_setting;
 
 use client::{telemetry::Telemetry, TelemetrySettings};
+use copilot_ui;
 use db::kvp::KEY_VALUE_STORE;
 use gpui::{
     svg, AnyElement, AppContext, EventEmitter, FocusHandle, FocusableView, InteractiveElement,
@@ -10,7 +11,7 @@ use gpui::{
 };
 use settings::{Settings, SettingsStore};
 use std::sync::Arc;
-use ui::{prelude::*, Checkbox};
+use ui::{prelude::*, CheckboxWithLabel};
 use vim::VimModeSetting;
 use workspace::{
     dock::DockPosition,
@@ -28,7 +29,7 @@ pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(|workspace: &mut Workspace, _cx| {
         workspace.register_action(|workspace, _: &Welcome, cx| {
             let welcome_page = WelcomePage::new(workspace, cx);
-            workspace.add_item(Box::new(welcome_page), cx)
+            workspace.add_item_to_active_pane(Box::new(welcome_page), cx)
         });
     })
     .detach();
@@ -36,8 +37,8 @@ pub fn init(cx: &mut AppContext) {
     base_keymap_picker::init(cx);
 }
 
-pub fn show_welcome_view(app_state: &Arc<AppState>, cx: &mut AppContext) {
-    open_new(&app_state, cx, |workspace, cx| {
+pub fn show_welcome_view(app_state: Arc<AppState>, cx: &mut AppContext) {
+    open_new(app_state, cx, |workspace, cx| {
         workspace.toggle_dock(DockPosition::Left, cx);
         let welcome_page = WelcomePage::new(workspace, cx);
         workspace.add_item_to_center(Box::new(welcome_page.clone()), cx);
@@ -61,7 +62,7 @@ pub struct WelcomePage {
 impl Render for WelcomePage {
     fn render(&mut self, cx: &mut gpui::ViewContext<Self>) -> impl IntoElement {
         h_flex()
-            .full()
+            .size_full()
             .bg(cx.theme().colors().editor_background)
             .track_focus(&self.focus_handle)
             .child(
@@ -134,6 +135,16 @@ impl Render for WelcomePage {
                                             })
                                             .detach_and_log_err(cx);
                                     })),
+                            )
+                            .child(
+                                Button::new("sign-in-to-copilot", "Sign in to GitHub Copilot")
+                                    .full_width()
+                                    .on_click(cx.listener(|this, _, cx| {
+                                        this.telemetry.report_app_event(
+                                            "welcome page: sign in to copilot".to_string(),
+                                        );
+                                        copilot_ui::initiate_sign_in(cx);
+                                    })),
                             ),
                     )
                     .child(
@@ -144,111 +155,76 @@ impl Render for WelcomePage {
                             .border_1()
                             .border_color(cx.theme().colors().border)
                             .rounded_md()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new(
-                                            "enable-vim",
-                                            if VimModeSetting::get_global(cx).0 {
-                                                ui::Selection::Selected
-                                            } else {
-                                                ui::Selection::Unselected
-                                            },
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, selection, cx| {
-                                                this.telemetry.report_app_event(
-                                                    "welcome page: toggle vim".to_string(),
-                                                );
-                                                this.update_settings::<VimModeSetting>(
-                                                    selection,
-                                                    cx,
-                                                    |setting, value| *setting = Some(value),
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                    .child(Label::new("Enable vim mode")),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new(
-                                            "enable-telemetry",
-                                            if TelemetrySettings::get_global(cx).metrics {
-                                                ui::Selection::Selected
-                                            } else {
-                                                ui::Selection::Unselected
-                                            },
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, selection, cx| {
-                                                this.telemetry.report_app_event(
-                                                    "welcome page: toggle metric telemetry"
-                                                        .to_string(),
-                                                );
-                                                this.update_settings::<TelemetrySettings>(
-                                                    selection,
-                                                    cx,
-                                                    {
-                                                        let telemetry = this.telemetry.clone();
+                            .child(CheckboxWithLabel::new(
+                                "enable-vim",
+                                Label::new("Enable vim mode"),
+                                if VimModeSetting::get_global(cx).0 {
+                                    ui::Selection::Selected
+                                } else {
+                                    ui::Selection::Unselected
+                                },
+                                cx.listener(move |this, selection, cx| {
+                                    this.telemetry
+                                        .report_app_event("welcome page: toggle vim".to_string());
+                                    this.update_settings::<VimModeSetting>(
+                                        selection,
+                                        cx,
+                                        |setting, value| *setting = Some(value),
+                                    );
+                                }),
+                            ))
+                            .child(CheckboxWithLabel::new(
+                                "enable-telemetry",
+                                Label::new("Send anonymous usage data"),
+                                if TelemetrySettings::get_global(cx).metrics {
+                                    ui::Selection::Selected
+                                } else {
+                                    ui::Selection::Unselected
+                                },
+                                cx.listener(move |this, selection, cx| {
+                                    this.telemetry.report_app_event(
+                                        "welcome page: toggle metric telemetry".to_string(),
+                                    );
+                                    this.update_settings::<TelemetrySettings>(selection, cx, {
+                                        let telemetry = this.telemetry.clone();
 
-                                                        move |settings, value| {
-                                                            settings.metrics = Some(value);
+                                        move |settings, value| {
+                                            settings.metrics = Some(value);
 
-                                                            telemetry.report_setting_event(
-                                                                "metric telemetry",
-                                                                value.to_string(),
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                    .child(Label::new("Send anonymous usage data")),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new(
-                                            "enable-crash",
-                                            if TelemetrySettings::get_global(cx).diagnostics {
-                                                ui::Selection::Selected
-                                            } else {
-                                                ui::Selection::Unselected
-                                            },
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, selection, cx| {
-                                                this.telemetry.report_app_event(
-                                                    "welcome page: toggle diagnostic telemetry"
-                                                        .to_string(),
-                                                );
-                                                this.update_settings::<TelemetrySettings>(
-                                                    selection,
-                                                    cx,
-                                                    {
-                                                        let telemetry = this.telemetry.clone();
+                                            telemetry.report_setting_event(
+                                                "metric telemetry",
+                                                value.to_string(),
+                                            );
+                                        }
+                                    });
+                                }),
+                            ))
+                            .child(CheckboxWithLabel::new(
+                                "enable-crash",
+                                Label::new("Send crash reports"),
+                                if TelemetrySettings::get_global(cx).diagnostics {
+                                    ui::Selection::Selected
+                                } else {
+                                    ui::Selection::Unselected
+                                },
+                                cx.listener(move |this, selection, cx| {
+                                    this.telemetry.report_app_event(
+                                        "welcome page: toggle diagnostic telemetry".to_string(),
+                                    );
+                                    this.update_settings::<TelemetrySettings>(selection, cx, {
+                                        let telemetry = this.telemetry.clone();
 
-                                                        move |settings, value| {
-                                                            settings.diagnostics = Some(value);
+                                        move |settings, value| {
+                                            settings.diagnostics = Some(value);
 
-                                                            telemetry.report_setting_event(
-                                                                "diagnostic telemetry",
-                                                                value.to_string(),
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                    .child(Label::new("Send crash reports")),
-                            ),
+                                            telemetry.report_setting_event(
+                                                "diagnostic telemetry",
+                                                value.to_string(),
+                                            );
+                                        }
+                                    });
+                                }),
+                            )),
                     ),
             )
     }
